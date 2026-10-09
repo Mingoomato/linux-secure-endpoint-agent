@@ -4,7 +4,7 @@
 
 This repository is a local educational agent/control-server pair. It demonstrates synthetic telemetry, durable SQLite spooling, TLS client/server authentication, per-event acknowledgements, server-side idempotency, privacy filtering, and detached Ed25519 policy verification. TLS proves transport peer identity; a separate policy signature proves the policy issuer's authority. Neither implies that the policy is safely applied to a production endpoint.
 
-Release build and the loopback mTLS integration CTest passed; a separate ASan/UBSan smoke run is recorded as passed. The test covers authorized local TLS, one synthetic event delivery, acknowledgement/dequeue, duplicate behavior, conflicting event-ID rejection, an unregistered certificate, and valid/tampered/replayed policies. SRS-06 remains partially implemented: no production enrollment, revocation/deny-list lifecycle, server policy publishing/signing, offline restart test, event.v1 file input, 429/backpressure protocol, robust parser fuzzing, real metrics endpoint, or performance benchmark. The server is sequential with a minimal HTTP parser. Policy is validated and persisted as last-good state; no file-monitoring or enforcement module consumes it.
+Release build and the loopback integration plus two parser CTests passed 3/3; the separate ASan/UBSan suite also passed 3/3. Coverage includes authorized local TLS, synthetic event delivery/ACK, deduplication and conflicting IDs, an unregistered certificate, signed policy checks, and strict JSON number/whitespace/key/depth/size parsing in both agent and server copies. SRS-06 remains partially implemented: no production enrollment, revocation/deny-list lifecycle, server policy publishing/signing, offline restart test, event.v1 file input, 429/backpressure protocol, HTTP parser fuzzing, real metrics endpoint, or performance benchmark. The server is sequential with a minimal HTTP parser. Policy is validated and persisted as last-good state; no file-monitoring or enforcement module consumes it.
 
 ## Why each subsystem exists
 
@@ -15,6 +15,7 @@ Release build and the loopback mTLS integration CTest passed; a separate ASan/UB
 | TLS client | Verifies CA chain and DNS/IP SAN, sends client certificate, and restricts the destination to loopback. | `client_context`, `connect_socket`, `send_batch` |
 | ACK and retry logic | Keeps unacknowledged records after failure and bounds retry attempts/backoff. | `ack_ids`, `flush` |
 | TLS reference server | Requires a client certificate, maps CN to local allowlist, accepts bounded batch requests. | `run_server`, `serve_one`, `read_request` |
+| Bounded JSON parser | Rejects non-JSON number forms, duplicate keys, excessive nesting, and oversized records before protocol decisions. | `agent/include/agent/json.hpp`, `server/include/agent/json.hpp` |
 | Idempotent ingestion | Stores a unique `(agent_id,event_id)` and compares duplicate sequence/hash before acknowledging. | `ingest`, SQLite schema |
 | Policy signature validator | Separately verifies raw Ed25519 signatures, scope, expiry, allowlisted actions, and monotonic revision. | `validate_signed_policy` |
 | C transport probe | Isolated POSIX socket exercise for loopback reachability. | `transport-c/src/sw_probe.c` |
@@ -34,7 +35,7 @@ Release build and the loopback mTLS integration CTest passed; a separate ASan/UB
 1. `run_server` rejects non-loopback bind values, loads TLS server cert/key/CA and an allowlist, opens the DB, creates a `SOCK_STREAM | SOCK_CLOEXEC` listener, binds to `INADDR_LOOPBACK`, and listens.
 2. A sequential `accept4` loop passes one connection to `serve_one` at a time. `SSL_accept` verifies the client certificate chain. `peer_cn` maps the certificate common name to the local allowlist.
 3. `read_request` accumulates a capped HTTP request and extracts `Content-Length`; `serve_one` routes health/status/telemetry/policy requests.
-4. `ingest` parses `agent_batch.v1`, checks claimed agent ID against certificate identity and allowlist, bounds event count, rejects sensitive-looking keys, canonicalizes payload JSON, verifies SHA-256, and writes rows in a transaction.
+4. The bounded parser enforces JSON number grammar, JSON whitespace, duplicate-key rejection, depth 32, and 1 MiB input size. `ingest` then checks batch version, claimed agent ID, certificate identity and allowlist, event count, sensitive-looking keys, payload SHA-256, and transactionally writes rows.
 5. The server commits before returning accepted/duplicate IDs. Same ID/sequence/hash is an idempotent duplicate; same ID with changed content is rejected.
 
 ### Policy path
@@ -63,6 +64,7 @@ The minimal HTTP parser does not implement the full HTTP/1.1 grammar; chunked tr
 - A **Unix domain socket** could simplify local-only transport but would not teach certificate-based mutual TLS or hostname verification.
 - A **message broker** could provide durable server-side ingestion and backpressure, but adds broker credentials, schema evolution, and operational state.
 - A **concurrent server** with a bounded worker pool improves throughput but must bound file descriptors, TLS handshakes, queue depth, and DB transactions.
+- A maintained **JSON library** reduces parser maintenance and Unicode edge-case risk; the lab keeps a custom parser so input bounds and accepted grammar can be studied. The duplicated agent/server headers need identical tests or later consolidation.
 - A **device enrollment registry with certificate fingerprints/SAN URI** is stronger than a CN text allowlist, but needs issuance, rotation, revocation, and tenant lifecycle design.
 - A policy **active configuration** requires prepare/commit/rollback with a consumer and audit trail. Persisting a signed document alone is not evidence of application.
 
@@ -76,4 +78,5 @@ Read `docs/ARCHITECTURE.md`, `docs/THREAT_MODEL.md`, and `docs/KEY_MANAGEMENT.md
 - [OpenSSL certificate verification](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [hostname verification](https://docs.openssl.org/3.0/man3/SSL_set1_host/)
 - [SQLite WAL](https://www.sqlite.org/wal.html), [SQLite Atomic Commit](https://www.sqlite.org/atomiccommit.html)
 - [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110)
+- [RFC 8259 — The JSON Data Interchange Format](https://www.rfc-editor.org/rfc/rfc8259.html)
 - [systemd execution environment and hardening](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)

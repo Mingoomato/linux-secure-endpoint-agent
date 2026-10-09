@@ -2,6 +2,8 @@
 #define BDETECT_JSON_HPP
 
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cerrno>
 #include <cstdlib>
@@ -47,7 +49,43 @@ public:
 private:
     const std::string &input_;
     std::size_t pos_ = 0;
-    void ws() { while (pos_ < input_.size() && std::isspace(static_cast<unsigned char>(input_[pos_]))) ++pos_; }
+    void ws() {
+        while (pos_ < input_.size() && (input_[pos_] == ' ' || input_[pos_] == '\t' ||
+               input_[pos_] == '\n' || input_[pos_] == '\r')) ++pos_;
+    }
+    static bool digit(char c) { return c >= '0' && c <= '9'; }
+    double number() {
+        const std::size_t start = pos_;
+        if (input_[pos_] == '-') ++pos_;
+        if (pos_ >= input_.size()) throw std::runtime_error("invalid JSON number");
+        if (input_[pos_] == '0') {
+            ++pos_;
+            if (pos_ < input_.size() && digit(input_[pos_]))
+                throw std::runtime_error("leading zero in JSON number");
+        } else if (input_[pos_] >= '1' && input_[pos_] <= '9') {
+            do { ++pos_; } while (pos_ < input_.size() && digit(input_[pos_]));
+        } else throw std::runtime_error("invalid JSON number");
+        if (pos_ < input_.size() && input_[pos_] == '.') {
+            ++pos_;
+            if (pos_ >= input_.size() || !digit(input_[pos_]))
+                throw std::runtime_error("invalid JSON fraction");
+            do { ++pos_; } while (pos_ < input_.size() && digit(input_[pos_]));
+        }
+        if (pos_ < input_.size() && (input_[pos_] == 'e' || input_[pos_] == 'E')) {
+            ++pos_;
+            if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-')) ++pos_;
+            if (pos_ >= input_.size() || !digit(input_[pos_]))
+                throw std::runtime_error("invalid JSON exponent");
+            do { ++pos_; } while (pos_ < input_.size() && digit(input_[pos_]));
+        }
+        double result = 0.0;
+        const char *begin = input_.data() + start;
+        const char *end = input_.data() + pos_;
+        auto parsed = std::from_chars(begin, end, result, std::chars_format::general);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(result))
+            throw std::runtime_error("JSON number out of range");
+        return result;
+    }
     char take() { if (pos_ >= input_.size()) throw std::runtime_error("unexpected end of JSON"); return input_[pos_++]; }
     bool eat(char c) { ws(); if (pos_ < input_.size() && input_[pos_] == c) { ++pos_; return true; } return false; }
     std::string string() {
@@ -123,13 +161,7 @@ private:
         if (input_.compare(pos_, 4, "true") == 0) { pos_ += 4; return Value{true}; }
         if (input_.compare(pos_, 5, "false") == 0) { pos_ += 5; return Value{false}; }
         if (input_.compare(pos_, 4, "null") == 0) { pos_ += 4; return Value{nullptr}; }
-        char *end = nullptr;
-        errno = 0;
-        const char *begin = input_.c_str() + pos_;
-        double n = std::strtod(begin, &end);
-        if (end == begin || errno == ERANGE) throw std::runtime_error("invalid JSON number");
-        pos_ += static_cast<std::size_t>(end - begin);
-        return Value{n};
+        return Value{number()};
     }
 };
 } // namespace agent::json

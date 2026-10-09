@@ -1,13 +1,13 @@
 # Requirements traceability (SRS-06)
 
-The recorded loopback smoke test verifies selected mTLS, queue, deduplication, and policy-signature paths. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by this test.
+The recorded loopback integration and parser tests verify selected mTLS, queue, deduplication, policy-signature, and strict JSON parsing paths. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
 
 | Requirement | Source / artifact | Verification | Status |
 |---|---|---|---|
 | SEA-FR-001 | server peer certificate CN + allowlist | tests/smoke.sh (mTLS authorization paths) | IN_PROGRESS |
 | SEA-FR-002 | agent TLS peer verification with DNS/IP SAN | SEA-T-002 pending | IMPLEMENTED |
 | SEA-FR-003 | TLS minimum TLS 1.2 | protocol test pending | IMPLEMENTED |
-| SEA-FR-004 | CLI TLS inputs and bounds | invalid config tests pending | IN_PROGRESS |
+| SEA-FR-004 | CLI TLS inputs and bounds; JSON parser number, whitespace, duplicate-key, depth, and record-size limits | tests/json_parser_test.cpp; invalid config tests pending | IN_PROGRESS |
 | SEA-FR-005 | agent command dispatch | CLI smoke pending | IN_PROGRESS |
 | SEA-FR-006 | synthetic health event channel | SEA-T-004 pending | IMPLEMENTED |
 | SEA-FR-007 | sequence, UUID, timestamp, payload hash | SEA-T-004 pending | IMPLEMENTED |
@@ -20,7 +20,7 @@ The recorded loopback smoke test verifies selected mTLS, queue, deduplication, a
 | SEA-FR-014 | monotonic revision and last-good DB | SEA-T-009 pending | IN_PROGRESS |
 | SEA-FR-015 | validate then transactional last-good swap | SEA-T-011 pending | IN_PROGRESS |
 | SEA-FR-016 | registry, telemetry, heartbeat, status, health routes | contract tests pending | IN_PROGRESS |
-| SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection | SEA-T-012 pending | IN_PROGRESS |
+| SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection and strict JSON parsing | parser CTests; SEA-T-012 privacy tests pending | IN_PROGRESS |
 | SEA-FR-018 | systemd units, PID stop, service controls | SEA-T-014 pending | IN_PROGRESS |
 | SEA-FR-019 | logs omit key/token/payload values | source review pending | IN_PROGRESS |
 | SEA-FR-020 | loopback-only bind/connect | SEA-T-016 pending | IMPLEMENTED |

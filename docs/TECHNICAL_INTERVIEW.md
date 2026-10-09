@@ -40,5 +40,7 @@ Questions only; no answer key is included. Defend identity, durability, and ACK 
 25. What is the difference between durable policy storage and a successfully applied runtime policy?
 26. Which tests are needed before claiming offline reconnect, certificate expiry handling, and key rotation?
 27. Why do the current integration tests not establish production readiness or owner mastery?
+28. Why does the parser validate JSON number grammar before calling `std::from_chars`, and which malformed tokens should be rejected?
+29. Why are the agent and server parser headers tested separately, and what maintenance risk remains because they are duplicated?
 
 Owner mastery requires direct evidence from an independently completed exercise and reasoned defense; build/test success alone is not proof.

@@ -26,10 +26,15 @@ The unit examples run under dedicated `swagent`/`swserver` users, `NoNewPrivileg
 
 TLS handshake errors, wrong SAN, absent/invalid client certificate, unavailable server, malformed HTTP, oversized bodies, invalid JSON, queue quota, DB failure, invalid ACK, and policy signature/revision rejection are distinct failure classes. Queue retention protects against transient transport errors; disk exhaustion cannot retain new events and must be surfaced as degraded rather than silently claiming delivery.
 
+## JSON parser boundaries
+
+The local parser checks the JSON number grammar before conversion: an optional minus, no leading zero, and nonempty digits after any fraction or exponent marker. It permits only JSON's four whitespace bytes and rejects duplicate object names, nesting deeper than 32, and input above 1 MiB. `std::from_chars` converts the isolated token without depending on process locale; conversion errors and non-finite results are rejected. This avoids permissive C number parsing accepting `+1`, `01`, `NaN`, or a partial token. The agent and server keep separate header copies and compile the same parser regression suite against both. Escaped Unicode surrogate code points are currently rejected, so the parser is deliberately conservative rather than a complete Unicode implementation.
+
 ## Official references
 
 - [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`connect(2)`](https://man7.org/linux/man-pages/man2/connect.2.html), [`bind(2)`](https://man7.org/linux/man-pages/man2/bind.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`close(2)`](https://man7.org/linux/man-pages/man2/close.2.html)
 - [OpenSSL peer-certificate verification](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [DNS/IP verification](https://docs.openssl.org/3.0/man3/SSL_set1_host/)
 - [SQLite WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html)
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446), [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110)
+- [RFC 8259 — The JSON Data Interchange Format](https://www.rfc-editor.org/rfc/rfc8259.html)
 - [systemd execution controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
