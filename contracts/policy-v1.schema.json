@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Policy v1",
+  "type": "object",
+  "required": ["schema_version", "policy_id", "revision", "issuer", "issued_at", "expires_at", "tenant_scope", "allowed_actions", "settings"],
+  "properties": {
+    "schema_version": {"const": "policy.v1"},
+    "policy_id": {"type": "string"},
+    "revision": {"type": "integer", "minimum": 1},
+    "issuer": {"type": "string"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "tenant_scope": {"type": "string"},
+    "allowed_actions": {"type": "array", "items": {"enum": ["telemetry.configure", "monitor.roots.configure"]}},
+    "settings": {
+      "type": "object",
+      "properties": {
+        "telemetry_enabled": {"type": "boolean"},
+        "sample_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "monitored_roots": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

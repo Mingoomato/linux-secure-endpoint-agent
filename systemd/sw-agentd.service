@@ -1,0 +1,24 @@
+[Unit]
+Description=LinuxSecurity Lab Endpoint Agent
+After=network.target
+
+[Service]
+Type=simple
+User=swagent
+Group=swagent
+ExecStart=/usr/bin/sw-agentd run --endpoint 127.0.0.1 --port 8443 --agent-id 00000000-0000-4000-8000-000000000001 --ca /etc/sw-agent/ca.crt --cert /etc/sw-agent/agent.crt --key /etc/sw-agent/agent.key --store /var/lib/sw-agent --interval-seconds 60 --pidfile /run/sw-agentd.pid
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/sw-agent /run
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

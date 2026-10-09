@@ -1,0 +1,42 @@
+openapi: 3.1.0
+info:
+  title: LinuxSecurity lab control API
+  version: 1.0.0
+servers:
+  - url: https://127.0.0.1:8443
+    description: Loopback-only lab server
+paths:
+  /healthz:
+    get:
+      responses:
+        "200": {description: Service health only}
+  /v1/agents/self/policy:
+    get:
+      security: [{agentCertificate: []}]
+      responses:
+        "304": {description: No changed policy in the reference server}
+  /v1/agents/self/events:batch:
+    post:
+      security: [{agentCertificate: []}]
+      responses:
+        "200": {description: Committed event IDs and duplicate IDs}
+        "400": {description: Invalid batch}
+        "403": {description: Certificate identity is not registered}
+  /v1/agents/self/heartbeat:
+    post:
+      security: [{agentCertificate: []}]
+      responses:
+        "200": {description: Heartbeat acknowledged}
+  /v1/agents/self/status:
+    get:
+      security: [{agentCertificate: []}]
+      responses:
+        "200": {description: Registered agent status}
+  /v1/admin/policies:
+    post:
+      responses:
+        "403": {description: Disabled in this lab build}
+components:
+  securitySchemes:
+    agentCertificate:
+      type: mutualTLS

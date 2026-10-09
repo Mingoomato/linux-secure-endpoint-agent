@@ -1,0 +1,23 @@
+[Unit]
+Description=LinuxSecurity Lab Control Server
+After=network.target
+
+[Service]
+Type=simple
+User=swserver
+Group=swserver
+ExecStart=/usr/bin/sw-server run --bind 127.0.0.1 --port 8443 --ca /etc/sw-server/ca.crt --cert /etc/sw-server/server.crt --key /etc/sw-server/server.key --agents /etc/sw-server/agents.txt --db /var/lib/sw-server/server.sqlite
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/sw-server
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

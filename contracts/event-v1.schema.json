@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "event.v1 input",
+  "type": "object",
+  "required": ["schema_version", "event_id", "source", "observed_at", "kind", "target", "actor", "coverage"],
+  "properties": {
+    "schema_version": {"const": "event.v1"},
+    "event_id": {"type": "string"},
+    "source": {"type": "string"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "kind": {"type": "string"},
+    "target": {"type": "object"},
+    "actor": {"type": "object"},
+    "coverage": {"type": "object"}
+  }
+}

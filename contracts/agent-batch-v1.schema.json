@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent batch v1",
+  "type": "object",
+  "required": ["schema_version", "batch_id", "agent_id", "events"],
+  "properties": {
+    "schema_version": {"const": "agent_batch.v1"},
+    "batch_id": {"type": "string", "maxLength": 128},
+    "agent_id": {"type": "string", "maxLength": 128},
+    "events": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["event_id", "sequence", "observed_at", "kind", "coverage", "payload", "payload_hash"]}}
+  },
+  "additionalProperties": false
+}
