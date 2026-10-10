@@ -39,7 +39,7 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 - Watch preflight가 접근 불가 하위 디렉터리, watch limit, inotify 초기화 실패에서 정책 commit을 막고 직전 last-good row를 보존하는지 확인한다.
 - Runtime reload 중 watch 준비 실패가 기존 collector FD와 기존 정책을 유지하는지, 이후 더 높은 정상 revision에서 교체되는지 확인한다.
 - Watch preflight 완료 뒤 root 권한/마운트가 바뀌는 경쟁 조건과 process restart 후 stored policy 적용을 확인한다.
-- 구현된 파일 rename-cookie pair/mismatch/timeout 경로, 4,096 pending cap, overflow 시 보류 이벤트 배출을 확인한다. 디렉터리 이동은 pair되지 않는다. 누락 event history 복구는 구현되지 않았으므로 별도 baseline 설계가 필요하다.
+- 구현된 파일·디렉터리 rename-cookie pair/mismatch/timeout 경로, 총 4,096 pending cap, overflow 시 보류 이벤트 배출과 디렉터리 이동 후 watch tree 재구성을 확인한다. 누락 event history 복구는 구현되지 않았으므로 별도 baseline 설계가 필요하다.
 
 ## 추가 구현 후 실행할 agent registry 확인 항목
 

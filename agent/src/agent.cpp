@@ -1150,6 +1150,7 @@ class InotifyCollector {
     struct PendingMove {
         std::filesystem::path path;
         std::chrono::steady_clock::time_point observed_at;
+        bool directory = false;
     };
     int fd_ = -1;
     std::string store_;
@@ -1261,10 +1262,14 @@ class InotifyCollector {
     }
 
     bool rebuild() {
-        for (const auto &[watch, path] : watches_) {
-            (void)path;
-            (void)inotify_rm_watch(fd_, watch);
+        const int replacement = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (replacement < 0) {
+            degraded_ = true;
+            degraded_reason_ = "watch_rebuild_fd_unavailable";
+            return false;
         }
+        const int previous = fd_;
+        fd_ = replacement;
         watches_.clear();
         bool complete = true;
         for (const auto &root : roots_) {
@@ -1285,6 +1290,7 @@ class InotifyCollector {
             degraded_ = true;
             degraded_reason_ = roots_.empty() ? "no_monitored_roots" : "no_active_watches";
         }
+        if (previous >= 0) close(previous);
         return complete;
     }
 
@@ -1323,7 +1329,9 @@ class InotifyCollector {
                 ++it;
                 continue;
             }
-            process_file_event(db, policy, it->second.path, "file.moved_from", "IN_MOVED_FROM");
+            process_file_event(db, policy, it->second.path,
+                it->second.directory ? "directory.moved_from" : "file.moved_from",
+                "IN_MOVED_FROM");
             it = pending_moves_.erase(it);
         }
     }
@@ -1424,35 +1432,59 @@ public:
                 if (event->len == 0U || event->name[0] == '\0') continue;
                 const std::filesystem::path changed = parent / event->name;
                 const bool is_directory = (event->mask & IN_ISDIR) != 0;
-                if (!is_directory && (event->mask & IN_MOVED_FROM) != 0) {
+                if ((event->mask & IN_MOVED_FROM) != 0) {
+                    if (is_directory) {
+                        must_rebuild = true;
+                        degraded_ = true;
+                        degraded_reason_ = "directory_move_watch_rebuild";
+                        coverage_reported_ = false;
+                    }
                     if (event->cookie != 0U) {
                         const auto existing = pending_moves_.find(event->cookie);
                         if (existing != pending_moves_.end()) {
                             process_file_event(db, policy, existing->second.path,
-                                "file.moved_from", "IN_MOVED_FROM");
+                                existing->second.directory ? "directory.moved_from" : "file.moved_from",
+                                "IN_MOVED_FROM");
                             pending_moves_.erase(existing);
                         }
                         if (pending_moves_.size() < kMaxPendingMoves) {
                             pending_moves_.emplace(event->cookie,
-                                PendingMove{changed, std::chrono::steady_clock::now()});
+                                PendingMove{changed, std::chrono::steady_clock::now(), is_directory});
                         } else {
-                            process_file_event(db, policy, changed, "file.moved_from", "IN_MOVED_FROM");
+                            process_file_event(db, policy, changed,
+                                is_directory ? "directory.moved_from" : "file.moved_from", "IN_MOVED_FROM");
                         }
                     } else {
-                        process_file_event(db, policy, changed, "file.moved_from", "IN_MOVED_FROM");
+                        process_file_event(db, policy, changed,
+                            is_directory ? "directory.moved_from" : "file.moved_from", "IN_MOVED_FROM");
                     }
                     continue;
                 }
-                if (!is_directory && (event->mask & IN_MOVED_TO) != 0 && event->cookie != 0U) {
+                if ((event->mask & IN_MOVED_TO) != 0 && event->cookie != 0U) {
                     const auto from = pending_moves_.find(event->cookie);
-                    if (from != pending_moves_.end()) {
-                        process_file_event(db, policy, changed, "file.renamed", "IN_MOVED_PAIR");
+                    if (from != pending_moves_.end() && from->second.directory == is_directory) {
+                        process_file_event(db, policy, changed,
+                            is_directory ? "directory.renamed" : "file.renamed", "IN_MOVED_PAIR");
                         pending_moves_.erase(from);
+                        if (is_directory) {
+                            must_rebuild = true;
+                            degraded_ = true;
+                            degraded_reason_ = "directory_move_watch_rebuild";
+                            coverage_reported_ = false;
+                        }
                         continue;
                     }
                 }
                 if ((event->mask & (IN_CREATE | IN_MOVED_TO)) != 0 &&
                     is_directory) {
+                    if ((event->mask & IN_MOVED_TO) != 0) {
+                        process_file_event(db, policy, changed, "directory.moved_to", "IN_MOVED_TO");
+                        must_rebuild = true;
+                        degraded_ = true;
+                        degraded_reason_ = "directory_move_watch_rebuild";
+                        coverage_reported_ = false;
+                        continue;
+                    }
                     try {
                         const Root *root = root_for(parent);
                         if (!root) throw std::runtime_error("collector directory outside policy roots");

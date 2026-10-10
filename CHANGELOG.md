@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Pair directory move cookies, record matched and unmatched directory moves, and rebuild recursive watches on a fresh inotify FD. The new collector path has not been technically verified.
+
 ## 0.1.0 — 2026-10-10
 
 - Initial educational implementation based on the associated SRS.

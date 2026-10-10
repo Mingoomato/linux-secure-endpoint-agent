@@ -110,7 +110,7 @@ Rotation에서는 current와 pending pin이 잠시 동시에 허용됩니다. �
 2. 새 policy의 root watch tree를 임시 collector의 별도 inotify FD에서 먼저 준비합니다. 정책 저장 전 preflight가 실패하면 SQLite last-good row를 바꾸지 않습니다. Runtime reload에서도 candidate watcher가 ready일 때만 기존 collector와 policy를 교체하고, 실패하면 이전 active runtime state를 유지합니다. 실패한 동일 정책은 정책 sync 주기(미설정 시 60초) 뒤 다시 준비합니다. 각 root부터 디렉터리를 열고 watch를 등록한 다음 항목을 열거하여 자식 디렉터리를 감시합니다.
 3. create, close-write, attribute, delete, move 알림은 file metadata event로 분류합니다. 이름은 정규화 경로의 HMAC ID로 바꾸고, device/inode 등 제한된 메타데이터와 함께 event.v1 allowlist를 거쳐 sequence를 배정하고 SQLite queue에 기록합니다.
 4. queue의 bounded batch를 mTLS로 전송합니다. 인증된 server의 ACK/duplicate ID를 받은 항목만 제거합니다. 네트워크가 끊기면 queue row는 남습니다.
-5. overflow, 접근 실패, watch 한도 초과, 디렉터리 이동/삭제는 `coverage.watch_degraded`로 표현하고 watch tree를 다시 구성합니다. Overflow 사이에 실제로 놓친 변경은 baseline과 비교해 복구하지 않으므로 degraded 상태를 healthy로 과장하지 않습니다.
+5. 파일·디렉터리 이동은 cookie로 최대 1초 동안 짝짓고, 디렉터리 이동 뒤에는 watch tree를 다시 구성합니다. overflow, 접근 실패, watch 한도 초과, 디렉터리 이동/삭제에 따른 감시 손실은 `coverage.watch_degraded`로 표현합니다. Overflow 사이에 실제로 놓친 변경은 baseline과 비교해 복구하지 않으므로 degraded 상태를 healthy로 과장하지 않습니다.
 
 ### Linux 인터페이스, 수명, 동시성
 

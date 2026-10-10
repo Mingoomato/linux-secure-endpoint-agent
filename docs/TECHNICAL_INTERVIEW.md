@@ -118,6 +118,6 @@ Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변
 83. `/v1/admin/agents/{id}`의 상태 응답에서 fingerprint 전체를 반환하지 않는 설계의 이점과 운영상 단점은 무엇인가요?
 84. 현재 registry row를 SQLite에서 revoke하면 이미 완료된 TLS handshake가 열린 연결에 미치는 영향은 무엇인가요? 다중 요청 연결을 허용하도록 바꾸면 어떤 재인증/차단 경계가 필요할까요?
 85. 새 정책을 저장하기 전에 별도 inotify FD에서 watch tree를 준비하는 이유는 무엇인가요? preflight와 SQLite commit 사이 filesystem이 바뀌는 경우 어떤 한계가 남나요?
-86. `IN_MOVED_FROM`/`IN_MOVED_TO` cookie를 1초 동안 짝짓는 흐름에서 unmatched event와 4,096개 pending cap은 어떻게 처리하나요? 디렉터리 rename을 같은 방식으로 다루려면 어떤 추가 watch-tree 처리가 필요한가요?
+86. `IN_MOVED_FROM`/`IN_MOVED_TO` cookie를 1초 동안 짝짓는 흐름에서 unmatched event와 4,096개 pending cap은 어떻게 처리하나요? 디렉터리 rename 뒤 stale watch 경로를 없애기 위해 왜 watch tree를 재구성해야 하며 그동안의 누락은 어떻게 표현하나요?
 
 공식 참고: Linux [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`sqlite3` transaction API](https://www.sqlite.org/lang_transaction.html), OpenSSL [`X509_digest`](https://docs.openssl.org/3.0/man3/X509_digest/), [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), OpenSSL [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/), SQLite [WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html).
