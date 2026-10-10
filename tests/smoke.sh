@@ -78,6 +78,29 @@ def post(event):
     head, body = response.split(b"\r\n\r\n", 1)
     return head.split(b"\r\n", 1)[0], json.loads(body)
 
+def raw_status(request):
+    ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+    ctx.load_cert_chain(certs + "/agent.crt", certs + "/agent.key")
+    raw = socket.create_connection(("127.0.0.1", port), timeout=8)
+    raw.settimeout(8)
+    with ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock:
+        sock.sendall(request)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            try:
+                chunk = sock.recv(4096)
+            except (ConnectionResetError, ssl.SSLError):
+                break
+            if not chunk:
+                break
+            response += chunk
+    assert b"\r\n\r\n" in response, response
+    return response.split(b"\r\n", 1)[0]
+
+def expect_400(request):
+    status = raw_status(request)
+    assert status.startswith(b"HTTP/1.1 400 "), status
+
 payload = {"source":"test", "worker_count":1}
 event = {"event_id":"duplicate-smoke-event", "sequence":99001, "observed_at":"2026-10-10T00:00:00Z", "kind":"health.heartbeat", "coverage":"healthy", "payload":payload, "payload_hash":hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()).hexdigest()}
 status, first = post(event)
@@ -87,6 +110,18 @@ assert status.startswith(b"HTTP/1.1 200 ") and second["duplicate_ids"] == [event
 changed = dict(event, payload={"source":"changed"}, payload_hash=hashlib.sha256(b'{"source":"changed"}').hexdigest())
 status, rejected = post(changed)
 assert status.startswith(b"HTTP/1.1 400 ") and rejected["error"] == "request_rejected", (status, rejected)
+
+prefix = b"POST /v1/agents/self/events:batch HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+expect_400(prefix + b"Content-Length: 0\r\nContent-Length: 0\r\n\r\n")
+expect_400(prefix + b"Transfer-Encoding: chunked\r\n\r\n")
+expect_400(prefix + b"Content-Length: +1\r\n\r\n")
+expect_400(prefix + b"Content-Length: 1048577\r\n\r\n")
+expect_400(prefix + b"\r\n")
+expect_400(b"GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+expect_400(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1\r\n\r\nx")
+expect_400(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: localhost\r\n\r\n")
+expect_400(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: " + b"a" * 17000 + b"\r\n\r\n")
+expect_400(prefix + b"Content-Length: 1\r\n\r\n")
 PY
 
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$certs/rogue.key" >/dev/null 2>&1

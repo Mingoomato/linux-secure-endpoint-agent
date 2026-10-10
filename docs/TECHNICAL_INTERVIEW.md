@@ -1,46 +1,47 @@
-# Technical Defense — Linux Secure Endpoint Agent Lab
+# 기술 방어 질문 — Linux Secure Endpoint Agent Lab
 
-Questions only; no answer key is included. Defend identity, durability, and ACK behavior at each boundary.
+정답지는 포함하지 않습니다. 각 답변에서는 관련 코드 경로, 관찰한 테스트, 실패 시 데이터 상태를 근거로 설명하세요.
 
-## Code reading and data flow
+## 코드 읽기와 데이터 흐름
 
-1. Trace a synthetic heartbeat from `next_sequence`/`enqueue` to the `queue` row.
-2. Which SQLite settings and transaction boundaries make the local queue durable?
-3. How does `send_batch` select loopback addresses and configure DNS/IP SAN verification?
-4. What does mutual TLS authenticate on the client and server sides?
-5. How does `peer_cn` map a client certificate to an allowed agent, and what does the server compare with the batch `agent_id`?
-6. Trace an event through `ingest` to the accepted or duplicate ACK. At what point is the server DB commit complete?
-7. How does `flush` ensure the server cannot delete an event the agent did not send?
-8. Which fields are included in stored telemetry, and which payload bytes are hashed?
-9. Trace `validate_signed_policy` from raw-byte signature verification to policy-state transaction.
+1. `next_sequence`와 `enqueue`부터 `queue` row가 저장될 때까지 호출 순서를 설명하세요.
+2. 왜 event를 network 전 SQLite에 저장하나요? queue commit과 서버 ACK 사이에는 어떤 실패 구간이 있나요?
+3. `send_batch`가 DNS/IP 결과 중 loopback을 고르고 서버 SAN 검증을 설정하는 흐름을 설명하세요.
+4. mTLS handshake에서 client와 server 각각 무엇을 인증하며, 그 뒤 allowlist는 어떤 별도 판단을 하나요?
+5. client 인증서 CN, allowlist, request body의 `agent_id` 세 값이 어떻게 비교되나요?
+6. `ingest` transaction은 언제 commit되고, 어떤 시점 이후에 ACK가 전송되나요?
+7. Agent는 server 응답의 ID를 어떤 제출 batch와 비교한 뒤 queue에서 제거하나요?
+8. event payload hash가 계산되는 값과 server가 다시 계산하는 값은 무엇인가요?
+9. `validate_signed_policy`는 raw bytes 검증, JSON 검사, scope/expiry 확인, DB 변경을 어떤 순서로 수행하나요?
 
-## Debugging and failure behavior
+## Linux·메모리·실패 분석
 
-10. What happens when the server commits an event but the client does not receive its ACK?
-11. If the server repeats an event ID with a changed sequence or payload hash, why is that not a harmless duplicate?
-12. What happens when a response lacks `Content-Length`, exceeds the cap, or has malformed ACK JSON?
-13. Which queue failure occurs when the row/byte quota is reached, and can the new event still be retained?
-14. How can a process crash between sequence increment and event insert affect sequence values?
-15. Which raw socket, `SSL*`, `SSL_CTX*`, SQLite handle, and statement cleanup paths would you review after an injected error?
+10. TCP가 메시지 경계를 제공하지 않는다는 점이 `read_request`와 `http_exchange` 구현에 어떤 영향을 주나요?
+11. `SO_RCVTIMEO` 5초 설정이 보장하는 범위와 보장하지 않는 범위를 설명하세요.
+12. 예외가 `serve_one` 안에서 발생할 때 `SSL*`와 accepted FD 수명은 어떻게 끝나나요? 잠재적인 누수 경로를 찾으세요.
+13. 어떤 SQLite statement가 finalize되지 않으면 어떤 자원이 남나요? transaction rollback이 필요한 실패 경로는 무엇인가요?
+14. sequence update와 event insert가 별도 transaction이면 process crash 뒤 어떤 DB 상태가 가능한가요?
+15. server가 commit했지만 ACK가 유실되면 다음 시도에서 데이터가 왜 중복 생성되지 않나요?
 
-## Security and privacy
+## 디버깅과 보안 추론
 
-16. Why is hostname/SAN verification needed even when the server certificate chain is trusted?
-17. Why does server-side mTLS validation still require a local agent registry/allowlist?
-18. Why does TLS authentication not replace an Ed25519 policy signature?
-19. What does signing exact policy bytes imply for whitespace and canonicalization?
-20. Which sensitive fields does the server reject, and why is a key-name blacklist not a complete privacy control?
-21. What does a loopback-only bind prevent, and what attacks remain possible from local processes?
-22. Which limitations follow from a sequential server and custom HTTP parser?
+16. 두 개의 서로 다른 Content-Length가 같은 요청에 있을 때 현재 parser가 이를 거부해야 하는 이유는 무엇인가요?
+17. `Transfer-Encoding`을 지원하지 않으면서 명시적으로 거부하는 것과 조용히 무시하는 것의 차이는 무엇인가요?
+18. body가 선언한 길이보다 짧거나 길 때 parser와 DB 상태가 어떻게 되어야 하나요?
+19. 잘못된 SAN과 신뢰되지 않은 CA는 어느 계층에서 실패하고, unregistered CN은 어느 계층에서 실패하나요?
+20. 민감 키 이름 blacklist가 개인정보 보호를 완성하지 못하는 이유와 추가해야 할 경계는 무엇인가요?
+21. loopback-only bind가 막는 공격과 같은 호스트의 악성 프로세스에 대해 남는 공격면을 각각 설명하세요.
+22. queue quota와 disk full은 생성된 event의 내구성 주장에 어떤 영향을 주나요?
+23. 서명된 정책을 DB에 저장한 것과 endpoint에서 실제로 적용한 것을 어떻게 구별하나요?
 
-## Design tradeoffs
+## 설계 대안과 시험 범위
 
-23. Compare CN allowlisting with certificate fingerprint, SAN URI identity, and managed enrollment.
-24. How would a bounded concurrent worker pool affect socket pressure and SQLite contention?
-25. What is the difference between durable policy storage and a successfully applied runtime policy?
-26. Which tests are needed before claiming offline reconnect, certificate expiry handling, and key rotation?
-27. Why do the current integration tests not establish production readiness or owner mastery?
-28. Why does the parser validate JSON number grammar before calling `std::from_chars`, and which malformed tokens should be rejected?
-29. Why are the agent and server parser headers tested separately, and what maintenance risk remains because they are duplicated?
+24. custom HTTP parser를 유지하는 것과 검증된 HTTP library를 도입하는 선택을 안전성·학습성·유지보수 관점에서 비교하세요.
+25. 순차 server를 bounded worker pool로 바꾸면 FD, TLS handshake, SQLite writer 경합을 어떻게 제한해야 하나요?
+26. CN allowlist를 certificate fingerprint나 SAN URI identity로 바꾸면 enrollment와 rotation 설계에 어떤 변화가 필요한가요?
+27. DB unique key가 보장하는 멱등성과 네트워크 exactly-once 전달은 어떻게 다른가요?
+28. agent/server JSON parser 사본을 별도로 두는 이유와 drift 위험을 줄일 방안을 설명하세요.
+29. 현재 GCC/Clang·sanitizer·정적 분석·음성 framing 결과만으로 알 수 없는 SRS 항목은 무엇인가요?
+30. 이 저장소의 테스트 통과가 소유자의 개인 숙련도를 증명하지 않는 이유는 무엇이며, 독립 재현의 증거는 어떤 형태여야 하나요?
 
-Owner mastery requires direct evidence from an independently completed exercise and reasoned defense; build/test success alone is not proof.
+Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변을 관찰한 뒤에만 평가합니다. 현재 소유자 학습·재현 상태는 **관찰되지 않음**입니다.

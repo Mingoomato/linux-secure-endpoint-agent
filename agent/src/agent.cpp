@@ -26,7 +26,6 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -275,6 +274,43 @@ int connect_socket(const std::string &host, const std::string &port) {
     if (connected < 0) throw std::runtime_error("SEA_SERVER_UNREACHABLE: loopback connect failed");
     return connected;
 }
+constexpr std::size_t kMaxHttpHeader = 16U * 1024U;
+constexpr std::size_t kMaxHttpBody = 1024U * 1024U;
+bool http_token_char(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' ||
+        c == '+' || c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+std::string lowercase_ascii(std::string value) {
+    for (char &c : value) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return value;
+}
+std::string trim_http_value(std::string value) {
+    std::size_t first = value.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    std::size_t last = value.find_last_not_of(" \t");
+    return value.substr(first, last - first + 1U);
+}
+std::size_t parse_http_content_length(const std::string &value) {
+    if (value.empty()) throw std::runtime_error("SEA_ACK_MALFORMED: empty Content-Length");
+    std::size_t length = 0;
+    for (unsigned char c : value) {
+        if (c < '0' || c > '9') throw std::runtime_error("SEA_ACK_MALFORMED: invalid Content-Length");
+        std::size_t digit = static_cast<std::size_t>(c - '0');
+        if (length > (kMaxHttpBody - digit) / 10U)
+            throw std::runtime_error("SEA_ACK_MALFORMED: response body too large");
+        length = length * 10U + digit;
+    }
+    return length;
+}
+struct ScopedFd {
+    int value = -1;
+    explicit ScopedFd(int fd) : value(fd) {}
+    ~ScopedFd() { if (value >= 0) close(value); }
+    ScopedFd(const ScopedFd &) = delete;
+    ScopedFd &operator=(const ScopedFd &) = delete;
+    int get() const { return value; }
+};
 std::string http_exchange(SSL *ssl, const std::string &request) {
     std::size_t sent = 0;
     while (sent < request.size()) {
@@ -286,28 +322,74 @@ std::string http_exchange(SSL *ssl, const std::string &request) {
     std::array<char, 8192> buf {};
     std::size_t expected = 0;
     bool have_length = false;
-    while (response.size() < 1024U * 1024U) {
-        int n = SSL_read(ssl, buf.data(), static_cast<int>(buf.size()));
-        if (n <= 0) break;
-        response.append(buf.data(), static_cast<std::size_t>(n));
-        auto header_end = response.find("\r\n\r\n");
-        if (header_end != std::string::npos && !have_length) {
-            std::string headers = response.substr(0, header_end);
-            std::smatch match;
-            if (std::regex_search(headers, match, std::regex("Content-Length: ([0-9]+)", std::regex::icase))) {
-                expected = static_cast<std::size_t>(std::stoull(match[1].str()));
+    std::size_t header_end = std::string::npos;
+    for (;;) {
+        if (response.size() > kMaxHttpHeader + 4U + kMaxHttpBody)
+            throw std::runtime_error("SEA_ACK_MALFORMED: HTTP response exceeds size limit");
+        if (!have_length) {
+            header_end = response.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                if (header_end + 4U > kMaxHttpHeader)
+                    throw std::runtime_error("SEA_ACK_MALFORMED: HTTP response headers too large");
+                std::string headers = response.substr(0, header_end);
+                std::size_t first_end = headers.find("\r\n");
+                if (first_end == std::string::npos || first_end > 4096U)
+                    throw std::runtime_error("SEA_ACK_MALFORMED: invalid HTTP status line");
+                std::string status_line = headers.substr(0, first_end);
+                std::size_t first_space = status_line.find(' ');
+                std::size_t second_space = first_space == std::string::npos ? std::string::npos : status_line.find(' ', first_space + 1U);
+                if (first_space == std::string::npos || second_space == std::string::npos ||
+                    status_line.substr(0, first_space) != "HTTP/1.1" || second_space != first_space + 4U ||
+                    !std::all_of(status_line.begin() + static_cast<std::ptrdiff_t>(first_space + 1U),
+                        status_line.begin() + static_cast<std::ptrdiff_t>(second_space),
+                        [](unsigned char c) { return c >= '0' && c <= '9'; }))
+                    throw std::runtime_error("SEA_ACK_MALFORMED: invalid HTTP status line");
+                bool found_length = false;
+                std::size_t pos = first_end + 2U;
+                while (pos < headers.size()) {
+                    std::size_t line_end = headers.find("\r\n", pos);
+                    std::string field = headers.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+                    if (field.empty() || field.front() == ' ' || field.front() == '\t')
+                        throw std::runtime_error("SEA_ACK_MALFORMED: invalid or folded HTTP header");
+                    std::size_t colon = field.find(':');
+                    if (colon == std::string::npos || colon == 0U)
+                        throw std::runtime_error("SEA_ACK_MALFORMED: malformed HTTP header");
+                    std::string name = field.substr(0, colon);
+                    if (!std::all_of(name.begin(), name.end(), [](unsigned char c) { return http_token_char(c); }))
+                        throw std::runtime_error("SEA_ACK_MALFORMED: invalid HTTP header name");
+                    std::string value = trim_http_value(field.substr(colon + 1U));
+                    for (unsigned char c : value) if ((c < 0x20U && c != '\t') || c == 0x7fU)
+                        throw std::runtime_error("SEA_ACK_MALFORMED: invalid HTTP header value");
+                    std::string normalized = lowercase_ascii(name);
+                    if (normalized == "content-length") {
+                        if (found_length) throw std::runtime_error("SEA_ACK_MALFORMED: duplicate Content-Length");
+                        expected = parse_http_content_length(value);
+                        found_length = true;
+                    } else if (normalized == "transfer-encoding") {
+                        throw std::runtime_error("SEA_ACK_MALFORMED: Transfer-Encoding is unsupported");
+                    }
+                    if (line_end == std::string::npos) break;
+                    pos = line_end + 2U;
+                }
+                if (!found_length) throw std::runtime_error("SEA_ACK_MALFORMED: missing Content-Length");
                 have_length = true;
-            } else if (headers.find(" 204 ") != std::string::npos) {
-                expected = 0; have_length = true;
-            } else throw std::runtime_error("SEA_ACK_MALFORMED: missing Content-Length");
+                std::size_t expected_size = header_end + 4U + expected;
+                if (response.size() > expected_size)
+                    throw std::runtime_error("SEA_ACK_MALFORMED: bytes follow framed HTTP response");
+                if (response.size() == expected_size) return response;
+            } else if (response.size() > kMaxHttpHeader) {
+                throw std::runtime_error("SEA_ACK_MALFORMED: HTTP response headers too large");
+            }
+        } else {
+            std::size_t expected_size = header_end + 4U + expected;
+            if (response.size() > expected_size)
+                throw std::runtime_error("SEA_ACK_MALFORMED: bytes follow framed HTTP response");
+            if (response.size() == expected_size) return response;
         }
-        if (have_length) {
-            auto header_end2 = response.find("\r\n\r\n");
-            if (header_end2 != std::string::npos && response.size() >= header_end2 + 4U + expected) break;
-        }
+        int n = SSL_read(ssl, buf.data(), static_cast<int>(buf.size()));
+        if (n <= 0) throw std::runtime_error("SEA_ACK_MALFORMED: truncated HTTP response");
+        response.append(buf.data(), static_cast<std::size_t>(n));
     }
-    if (response.size() >= 1024U * 1024U) throw std::runtime_error("response size limit exceeded");
-    return response;
 }
 std::vector<std::string> ack_ids(const std::string &response, const std::string &key) {
     auto header_end = response.find("\r\n\r\n");
@@ -329,10 +411,11 @@ std::vector<std::string> ack_ids(const std::string &response, const std::string 
 std::vector<std::string> send_batch(const Config &c, const std::vector<Queued> &events) {
     if (events.empty()) return {};
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(client_context(c), SSL_CTX_free);
-    int fd = connect_socket(c.host, c.port);
+    ScopedFd socket_fd(connect_socket(c.host, c.port));
+    int fd = socket_fd.get();
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), SSL_free);
-    if (!ssl) { close(fd); throw std::runtime_error("TLS session allocation failed"); }
-    if (SSL_set_fd(ssl.get(), fd) != 1) { close(fd); throw std::runtime_error("TLS socket setup failed"); }
+    if (!ssl) throw std::runtime_error("TLS session allocation failed");
+    if (SSL_set_fd(ssl.get(), fd) != 1) throw std::runtime_error("TLS socket setup failed");
     in_addr ip4 {};
     in6_addr ip6 {};
     int verify_name = (inet_pton(AF_INET, c.host.c_str(), &ip4) == 1)
@@ -340,9 +423,8 @@ std::vector<std::string> send_batch(const Config &c, const std::vector<Queued> &
         : ((inet_pton(AF_INET6, c.host.c_str(), &ip6) == 1)
             ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl.get()), c.host.c_str())
             : SSL_set1_host(ssl.get(), c.host.c_str()));
-    if (verify_name != 1) { close(fd); throw std::runtime_error("TLS hostname verifier setup failed"); }
+    if (verify_name != 1) throw std::runtime_error("TLS hostname verifier setup failed");
     if (SSL_connect(ssl.get()) != 1 || SSL_get_verify_result(ssl.get()) != X509_V_OK) {
-        close(fd);
         throw std::runtime_error("SEA_TLS_UNTRUSTED_SERVER: TLS handshake/hostname verification failed");
     }
     std::string batch = "{\"schema_version\":\"agent_batch.v1\",\"batch_id\":\"" + uuid() +
@@ -356,7 +438,7 @@ std::vector<std::string> send_batch(const Config &c, const std::vector<Queued> &
         "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
         std::to_string(batch.size()) + "\r\n\r\n" + batch;
     std::string response = http_exchange(ssl.get(), req);
-    (void)SSL_shutdown(ssl.get()); close(fd);
+    (void)SSL_shutdown(ssl.get());
     auto accepted = ack_ids(response, "accepted_ids");
     auto duplicates = ack_ids(response, "duplicate_ids");
     accepted.insert(accepted.end(), duplicates.begin(), duplicates.end());
