@@ -1,5 +1,6 @@
 build/
 build-asan/
+build-asan-clang/
 build-clang/
 build-fuzz/
 cmake-build-*/

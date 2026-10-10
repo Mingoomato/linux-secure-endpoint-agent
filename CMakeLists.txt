@@ -27,7 +27,9 @@ target_compile_options(sw-probe PRIVATE -std=c17 -Wall -Wextra -Wpedantic -Werro
 
 include(CTest)
 if(BUILD_TESTING)
-    add_test(NAME sea-mtls-policy-smoke COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
+    add_test(NAME sea-mtls-policy-smoke
+        COMMAND ${CMAKE_COMMAND} -E env BIN_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
     set_tests_properties(sea-mtls-policy-smoke PROPERTIES TIMEOUT 180)
 
     add_executable(sea-json-agent-test tests/json_parser_test.cpp)

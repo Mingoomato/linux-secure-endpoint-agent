@@ -6,7 +6,7 @@
 
 `agent/src/agent.cpp`의 `main`이 하위 명령을 고르고 `Config`를 구성합니다. `is_loopback`은 network command가 외부 host를 대상으로 하지 못하게 제한합니다. `open_queue`는 전용 디렉터리를 준비하고 `spool.sqlite`에서 WAL, `synchronous=FULL`, queue/sequence/policy 테이블을 설정합니다.
 
-`next_sequence`는 `BEGIN IMMEDIATE` transaction으로 저장된 sequence를 읽고 증가시킵니다. `enqueue`는 고정 합성 상태 payload와 UUID, timestamp, payload hash를 만들고 quota를 확인해 row를 기록합니다. 이 저장이 `send_batch`보다 먼저 일어나는 것이 전송 실패 시 보존의 근거입니다.
+`run`은 `enqueue_synthetic_if_enabled`를 호출합니다. 이 함수는 `active_policy`로 SQLite의 last-good 정책을 읽고 tenant·revision·schema·expiry·settings·action scope를 다시 확인합니다. 활성 정책이 없거나 만료·비활성이면 새 row를 만들지 않습니다. `sample_rate=0`이면 생성만 억제하고, 0과 1 사이면 OpenSSL `RAND_bytes`를 이용한 균등 53-bit 표본으로 새 이벤트를 선택합니다. 허용된 이벤트에 한해 `next_sequence`가 `BEGIN IMMEDIATE` transaction으로 sequence를 증가시키고, `enqueue`가 고정 합성 상태 payload와 UUID, timestamp, payload hash를 만들고 quota를 확인해 row를 기록합니다. 이 저장이 `send_batch`보다 먼저 일어나는 것이 전송 실패 시 보존의 근거입니다.
 
 ## 2. Client TLS와 HTTP 응답
 
@@ -14,7 +14,7 @@
 
 요청은 `/v1/agents/self/events:batch`에 `application/json` body와 `Content-Length`를 포함합니다. `http_exchange`는 SSL write 전체를 보내고, 상태 줄과 각 header 문법을 확인합니다. 응답 header는 16 KiB, 본문은 1 MiB까지이고 Content-Length는 정확히 하나여야 합니다. 중복 길이, `Transfer-Encoding`, 잘못된 숫자, truncation, 선언 길이를 넘어온 바이트를 거부합니다. 이벤트 ACK는 HTTP 200이어야 하며 다른 status에서는 ID 배열을 처리하지 않습니다.
 
-`ack_ids`는 accepted/duplicate 배열을 JSON으로 파싱합니다. `flush`는 서버가 돌려준 값이 실제 보낸 ID인지 확인하고 확인된 항목만 SQLite transaction에서 제거합니다. 실패하면 남은 queue로 bounded retry를 반복합니다.
+`ack_ids`는 accepted/duplicate 배열을 JSON으로 파싱합니다. `flush`는 각 batch 앞에서 다시 `active_policy`를 확인합니다. telemetry가 비활성·만료면 `flush_paused=policy_inactive`를 출력하고 큐를 삭제하지 않은 채 정상 종료합니다. `sample_rate=0`만으로는 flush가 멈추지 않습니다. 활성 telemetry라면 서버가 돌려준 값이 실제 보낸 ID인지 확인하고 확인된 항목만 SQLite transaction에서 제거합니다. 실패하면 남은 queue로 bounded retry를 반복합니다.
 
 ## 3. Server의 수신부터 ACK까지
 
@@ -32,7 +32,7 @@ Server 시작 시 `run_server`는 `--operators`, `--admin-token-file`, `--policy
 
 `publish_policy`는 먼저 `validate_publishable_policy`로 허용 필드·tenant·시간·revision·action·settings 크기를 확인하고 raw document를 Ed25519 서명합니다. `BEGIN IMMEDIATE` 안에서 현재 revision을 읽고 같은 revision과 동일 bytes인 재요청만 idempotent로 승인합니다. 더 낮거나 같은 revision의 다른 문서는 거부하고, 새 문서/서명은 `policies` 행으로 교체한 뒤 commit합니다. 새 publication은 201, 동일 재전송은 200입니다. Agent GET은 document SHA-256을 ETag로 돌려주며, `If-None-Match`가 일치하면 본문 없는 304를 반환합니다.
 
-Agent의 `sync-policy`는 local last-good 문서가 있으면 그 SHA-256을 `If-None-Match`로 보냅니다. 304면 저장 상태를 변경하지 않습니다. 200 envelope면 signature hex를 64 raw bytes로 디코드하고 `validate_policy_document`를 호출합니다. 이 함수는 raw bytes signature를 JSON parse 전에 검증하고, 허용 schema·issuer/tenant scope·issued/expiry calendar time·safe integer revision·action·setting·canonical root containment를 검사합니다. `BEGIN IMMEDIATE` 뒤 monotonic revision을 재검사하고 `policy_state` 교체와 `policy_audit` 추가를 한 transaction에서 commit합니다. 실패하면 rollback되어 기존 last-good document와 audit가 그대로 남습니다. `validate-policy`는 파일 기반 동일 validator를 호출하는 독립 연습 경로입니다. 저장된 설정을 실제 collector에 적용하는 runtime hook은 아직 없으므로 DB 저장을 정책 실행으로 간주하지 마세요.
+Agent의 `sync-policy`는 local last-good 문서가 있으면 그 SHA-256을 `If-None-Match`로 보냅니다. 304면 저장 상태를 변경하지 않습니다. 200 envelope면 signature hex를 64 raw bytes로 디코드하고 `validate_policy_document`를 호출합니다. 이 함수는 raw bytes signature를 JSON parse 전에 검증하고, 허용 schema·issuer/tenant scope·issued/expiry calendar time·safe integer revision·action·setting·canonical root containment를 검사합니다. `BEGIN IMMEDIATE` 뒤 monotonic revision을 재검사하고 `policy_state` 교체와 `policy_audit` 추가를 한 transaction에서 commit합니다. 실패하면 rollback되어 기존 last-good document와 audit가 그대로 남습니다. `validate-policy`는 파일 기반 동일 validator를 호출하는 독립 연습 경로입니다. 실행 시 `active_policy`가 저장된 telemetry 설정을 다시 읽어 synthetic event 생성과 queue flush를 제어합니다. `status` 명령은 정책 상태와 revision, sample rate, monitored root 개수, queue 크기를 출력합니다. monitored roots는 아직 실제 file watcher에 연결되지 않았으므로 저장·검증을 수집 적용으로 간주하지 마세요.
 
 ## 5. 예외와 소유권 추적
 

@@ -28,6 +28,14 @@ Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subs
 
 정책 revision 숫자는 JSON parser 안에서 `double`로 표현됩니다. 음수·분수 또는 binary64가 정확히 표현할 수 없는 큰 정수는 unsigned 정수나 SQLite `INTEGER`에 바로 변환하지 말고 먼저 거부해야 합니다. 이 구현은 양의 안전 정수만 저장 가능한 범위로 받고, 음수·소수·`2^53` revision과 기존 last-good 값의 보존을 smoke에서 확인합니다.
 
+## 저장 정책의 runtime gate와 표본 추출
+
+`active_policy`는 SQLite `policy_state`에서 마지막 문서와 issuer/revision을 읽습니다. SQLite column 포인터는 statement finalize 뒤 유효하지 않으므로, 코드가 issuer와 document bytes를 소유형 문자열로 복사한 뒤 `sqlite3_finalize`를 호출합니다. JSON 문서를 다시 parse해 DB revision·issuer, tenant, expiry, settings와 `allowed_actions`를 대조합니다. 문서가 손상되었거나 tenant가 다르면 실행 경로는 오류를 내고 멈춥니다. 정책이 없으면 telemetry는 기본 비활성입니다.
+
+합성 이벤트 생성 경로는 `telemetry_enabled`가 false이거나 정책이 만료되면 새 이벤트를 저장하지 않습니다. `sample_rate`가 0이면 이벤트를 만들지 않고, 1이면 모두 만들며, 중간값이면 `RAND_bytes`가 제공한 64 random bit 중 상위 53 bit를 [0, 1) 범위 표본으로 사용해 설정 비율과 비교합니다. OpenSSL random API가 실패하면 표본을 추측해 계속하지 않고 오류 처리합니다. 표본 통과 후에만 sequence 증가·UUID 생성·SQLite enqueue를 진행하므로 제외된 샘플은 queue 용량을 차지하지 않습니다.
+
+`flush`는 각 전송 batch 전에 정책을 다시 읽습니다. 정책이 없거나 stale/telemetry-disabled이면 전송을 멈추고 기존 queue row를 유지합니다. `sample_rate=0`은 생성만 제어하므로 telemetry가 활성 상태면 기존 queue를 전송할 수 있습니다. 이미 네트워크 요청을 시작한 batch는 뒤에서 정책이 바뀌어도 취소되지 않습니다. `status`는 `NO_POLICY`, `STALE`, `ACTIVE`, `VALIDATED`와 revision, telemetry flag, sample rate, monitored root 수, queue 크기를 보여줍니다. root 값은 서명 정책에서 검증·보관되지만 이 저장소에는 실제 파일 watcher가 없습니다.
+
 ## SQLite transaction과 ACK 의미
 
 WAL은 변경을 `-wal` 파일에 기록하고 checkpoint를 통해 본 DB에 반영합니다. DB와 WAL은 실행 중 함께 상태의 일부이므로 DB 하나만 복사해 일관된 백업이라 가정하면 안 됩니다. WAL은 reader와 writer의 일부 동시 작업을 돕지만 한 번에 하나의 writer를 허용합니다.
@@ -44,7 +52,7 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 정책의 monitored root를 사용자 입력 문자열의 접두사 비교만으로 제한하면 안 됩니다. `..` 구성 요소는 allowlist prefix가 문자열에 남아 있어도 다른 디렉터리를 가리킬 수 있고, 심볼릭 링크는 겉으로 보이는 위치와 실제 대상을 분리합니다. Agent는 설정된 허용 디렉터리와 각 요청 경로를 `std::filesystem::canonical`로 정규화해 기존 디렉터리 여부를 확인한 다음 경로 구성 요소를 비교합니다. `/safe/root2`는 `/safe/root`의 하위 경로가 아니므로 텍스트 prefix가 아니라 component 경계가 중요합니다.
 
-이 검사는 정책 문서를 last-good 상태로 저장하기 전의 경로 유효성 검사입니다. 현재 runtime watcher가 없어 파일을 실제로 열지는 않습니다. 미래에 감시를 시작하면서 같은 경로를 다시 사용할 경우 검사와 사용 사이에 symlink가 바뀌는 TOCTOU 경쟁이 남을 수 있으므로, 디렉터리 FD 기반 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해야 합니다.
+이 검사는 정책 문서를 last-good 상태로 저장하기 전의 경로 유효성 검사입니다. runtime status는 root 개수만 보여주며 현재 파일 watcher가 없어 경로를 열거나 파일을 수집하지 않습니다. 미래에 감시를 시작하면서 같은 경로를 다시 사용할 경우 검사와 사용 사이에 symlink가 바뀌는 TOCTOU 경쟁이 남을 수 있으므로, 디렉터리 FD 기반 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해야 합니다.
 
 ## systemd와 프로세스 경계
 
@@ -55,6 +63,7 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 - Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`setsockopt(2)`](https://man7.org/linux/man-pages/man2/setsockopt.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html), [`close(2)`](https://man7.org/linux/man-pages/man2/close.2.html)
 - Linux path resolution: [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`realpath(3)`](https://man7.org/linux/man-pages/man3/realpath.3.html)
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
+- OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
 - IETF: [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)
 - LLVM: [libFuzzer documentation](https://llvm.org/docs/LibFuzzer.html)
 - SQLite: [WAL](https://www.sqlite.org/wal.html), [Atomic Commit](https://www.sqlite.org/atomiccommit.html)

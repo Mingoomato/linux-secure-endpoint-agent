@@ -3,7 +3,7 @@
 ## 요약
 
 - **구현 상태:** 부분 구현. 이 저장소는 교육용 loopback agent/control server이며 SRS 전체 기능을 구현했다고 주장하지 않습니다.
-- **기술 검증 상태:** GCC/Clang Release·ASan/UBSan 통합 게이트와 선택한 policy/HTTP 회귀 경로 통과. enrollment/revocation, runtime policy enforcement, 장애·성능·배포 행렬 등 SRS 게이트는 미완료입니다.
+- **기술 검증 상태:** GCC/Clang Release·ASan/UBSan 통합 게이트와 선택한 policy/HTTP 회귀 경로 통과. 합성 telemetry의 `telemetry_enabled`·`sample_rate` gate는 검증했지만 실제 monitored-root collector, enrollment/revocation, 장애·성능·배포 행렬 등 SRS 게이트는 미완료입니다.
 - **소유자 학습/독립 재현 상태:** 관찰되지 않음. 자동 테스트 성공은 개인 숙련도 증거가 아닙니다.
 
 ## 실행한 검증
@@ -16,6 +16,7 @@
 | GCC 16.2 및 Clang 21.1.8 AddressSanitizer + UndefinedBehaviorSanitizer 빌드/CTest | 각각 4/4 통과 |
 | Agent/Server JSON parser 각각의 CTest | 통과. 숫자 grammar, JSON whitespace, 중복 key, 깊이/크기 제한 포함 |
 | loopback mTLS/policy/queue integration | 통과. event ACK/dedup/ID 충돌과 미등록 client 거부; operator certificate+bearer token 권한 분리; 새 policy 게시 201 및 동일 재게시 200; 정확한 ETag 조건부 fetch 304; agent `sync-policy`; 서명된 잘못된 higher revision의 path-scope 거부 뒤 last-good revision/audit 보존, 후속 valid revision 저장; signature tamper/replay, `..` path traversal·외부 symlink·잘못된 calendar expiry·음수/분수/unsafe revision 거부; offline queue와 재시작 후 replay 포함 |
+| runtime policy gating | 통과. 정책 없는 store에서는 이벤트를 만들지 않고 상태가 `NO_POLICY`; tenant mismatch는 run을 거부; telemetry 비활성 정책은 queue 전송을 멈추고 행을 보존; telemetry 활성 + `sample_rate=0`은 새 이벤트를 만들지 않으면서 기존 행은 전송; `sample_rate=1`의 합성 이벤트 생성/전송 경로 포함 |
 | HTTP framing 및 media-type 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host/Content-Type, 누락/잘못된 Content-Type, header 초과, 미완성 body timeout, 1.5초 전체 HTTP request deadline에 대한 slow-client 거부, HTTP 400 ACK 거부와 queue 보존 확인 |
 | HTTP parser 직접 단위 테스트 | 통과. 정상 GET/POST, 불완전 head/body, line/header 오류, duplicate framing, 상한, 잘림·추가 바이트 확인 |
 | Clang libFuzzer + ASan/UBSan | 기존 로컬 corpus 233개 seed를 시작점으로 `max_len=16384`에서 100,000회 완료, crash/sanitizer finding 없음. coverage 643, feature count 2,347로 끝난 짧은 개발 campaign |
@@ -65,7 +66,7 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 - full HTTP grammar, long-duration parser fuzzing, absolute TLS handshake deadline, worker pool/동시 연결 부하
 - event/file input, queue quota·disk-full·DB write failure와 retry/backpressure 429 계약
 - production operator RBAC, certificate enrollment/rotation/revocation and denylist lifecycle
-- stored policy values applied to a runtime collector; current validation/last-good commit is not a runtime enforcement hook
+- `monitored_roots` applied to a real file watcher/collector; current behavior validates/counts roots only. Expired stored-policy runtime gating and concurrent update during an in-flight batch also need direct tests.
 - 10k event 처리량, p95/p99, CPU/RSS, 장시간 soak, 여러 배포판/커널 행렬
 - 전체 SRS NFR 검증 및 systemd 설치·실행·권한 경계의 실제 호스트 통합
 

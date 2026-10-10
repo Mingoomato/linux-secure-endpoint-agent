@@ -78,16 +78,13 @@ PY
 grep -q 'HTTP request absolute deadline exceeded' "$tmp/server.log"
 
 "$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
-    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
-    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store"
-"$bin_dir/sw-agentd" status --store "$tmp/agent-store" >"$tmp/agent-status.json"
-python3 - "$tmp/agent-status.json" "$tmp/server.sqlite" <<'PY'
-import json, sqlite3, sys
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/no-policy-store"
+"$bin_dir/sw-agentd" status --store "$tmp/no-policy-store" >"$tmp/no-policy-status.json"
+python3 - "$tmp/no-policy-status.json" <<'PY'
+import json, sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
-assert status["queued"] == 0, status
-db = sqlite3.connect(sys.argv[2])
-rows = db.execute("select count(*), min(sequence), min(length(payload_hash)) from events").fetchone()
-assert rows == (1, 1, 64), rows
+assert status["policy_status"] == "NO_POLICY" and not status["telemetry_enabled"] and status["queued"] == 0, status
 PY
 
 python3 - "$certs" "$port" <<'PY'
@@ -190,7 +187,7 @@ PY
 python3 - "$tmp/server.sqlite" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
-assert db.execute("select count(*) from events").fetchone()[0] == 2
+assert db.execute("select count(*) from events").fetchone()[0] == 1
 PY
 
 mkdir "$tmp/allowed-root"
@@ -244,13 +241,50 @@ assert status == 304 and body == b"", (status, body)
 PY
 
 sync_policy() {
+    store_path=$1
     "$bin_dir/sw-agentd" sync-policy --endpoint 127.0.0.1 --port "$port" \
         --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
-        --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/policy-sync-store" \
+        --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$store_path" \
         --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant --root "$tmp/allowed-root"
 }
-sync_policy >"$tmp/policy-sync-first.json"
-sync_policy >"$tmp/policy-sync-unchanged.json"
+publish_policy_update() {
+    revision=$1
+    telemetry_enabled=$2
+    sample_rate=$3
+    policy_file="$tmp/policy-runtime-$revision.json"
+    signature_file="$tmp/policy-runtime-$revision.sig"
+    python3 - "$tmp/policy.json" "$policy_file" "$revision" "$telemetry_enabled" "$sample_rate" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+policy["revision"] = int(sys.argv[3])
+policy["policy_id"] = "smoke-policy-runtime-" + sys.argv[3]
+policy["settings"]["telemetry_enabled"] = sys.argv[4] == "true"
+policy["settings"]["sample_rate"] = float(sys.argv[5])
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(policy, stream, separators=(",", ":"))
+PY
+    openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$policy_file" -out "$signature_file"
+    python3 - "$certs" "$port" "$tmp/admin-token" "$policy_file" <<'PY'
+import socket, ssl, sys
+certs, port, token_file, policy_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+body = open(policy_file, "rb").read()
+token = open(token_file, encoding="utf-8").read().strip()
+ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+ctx.load_cert_chain(certs + "/operator.crt", certs + "/operator.key")
+headers = ("Host: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Bearer " + token +
+    "\r\nContent-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n").encode()
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="127.0.0.1") as sock:
+    sock.sendall(b"POST /v1/admin/policies HTTP/1.1\r\n" + headers + body)
+    response = b""
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk: break
+        response += chunk
+assert response.startswith(b"HTTP/1.1 201 "), response
+PY
+}
+sync_policy "$tmp/policy-sync-store" >"$tmp/policy-sync-first.json"
+sync_policy "$tmp/policy-sync-store" >"$tmp/policy-sync-unchanged.json"
 python3 - "$tmp/policy-sync-store/spool.sqlite" "$tmp/policy-sync-first.json" "$tmp/policy-sync-unchanged.json" <<'PY'
 import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
@@ -259,6 +293,30 @@ assert row is not None and row[0] == 1
 assert db.execute("select count(*) from policy_audit").fetchone()[0] == 1
 assert json.load(open(sys.argv[2], encoding="utf-8"))["policy_status"] == "stored_last_good"
 assert json.load(open(sys.argv[3], encoding="utf-8"))["policy_status"] == "unchanged"
+PY
+
+sync_policy "$tmp/agent-store" >"$tmp/agent-policy-sync.json"
+set +e
+"$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant other-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store" \
+    >"$tmp/agent-wrong-tenant.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ]
+grep -q 'stored policy tenant mismatch' "$tmp/agent-wrong-tenant.log"
+"$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store"
+"$bin_dir/sw-agentd" status --store "$tmp/agent-store" >"$tmp/agent-status.json"
+python3 - "$tmp/agent-status.json" "$tmp/server.sqlite" <<'PY'
+import json, sqlite3, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["queued"] == 0 and status["policy_status"] == "ACTIVE", status
+assert status["policy_revision"] == 1 and status["sample_rate"] == 1 and status["monitored_root_count"] == 1, status
+db = sqlite3.connect(sys.argv[2])
+rows = db.execute("select count(*), min(sequence), min(length(payload_hash)) from events").fetchone()
+assert rows == (2, 1, 64), rows
 PY
 
 python3 - "$tmp/policy.json" "$tmp/policy-invalid-root.json" "$tmp/outside-root" <<'PY'
@@ -289,7 +347,7 @@ with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostn
 assert response.startswith(b"HTTP/1.1 201 "), response
 PY
 set +e
-sync_policy >"$tmp/policy-sync-rejected.json" 2>"$tmp/policy-sync-rejected.err"
+sync_policy "$tmp/policy-sync-store" >"$tmp/policy-sync-rejected.json" 2>"$tmp/policy-sync-rejected.err"
 rc=$?
 set -e
 [ "$rc" -ne 0 ]
@@ -326,13 +384,56 @@ with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostn
         response += chunk
 assert response.startswith(b"HTTP/1.1 201 "), response
 PY
-sync_policy >"$tmp/policy-sync-recovered.json"
+sync_policy "$tmp/policy-sync-store" >"$tmp/policy-sync-recovered.json"
 python3 - "$tmp/policy-sync-store/spool.sqlite" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 assert db.execute("select revision from policy_state where issuer='smoke-issuer'").fetchone()[0] == 3
 assert db.execute("select count(*) from policy_audit").fetchone()[0] == 2
 PY
+
+publish_policy_update 4 false 1
+sync_policy "$tmp/agent-store" >"$tmp/agent-policy-disabled.json"
+python3 - "$tmp/agent-store/spool.sqlite" <<'PY'
+import hashlib, json, sqlite3, sys
+payload = {"source":"runtime-retention-test", "worker_count":1}
+payload_text = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+event = {"event_id":"runtime-retained-event", "sequence":2, "observed_at":"2026-10-10T00:00:01Z",
+    "kind":"health.heartbeat", "coverage":"healthy", "payload":payload,
+    "payload_hash":hashlib.sha256(payload_text.encode()).hexdigest()}
+db = sqlite3.connect(sys.argv[1])
+db.execute("insert into queue(event_id,sequence,observed_at,payload,payload_hash) values(?,?,?,?,?)",
+    (event["event_id"], event["sequence"], event["observed_at"], json.dumps(event, separators=(",", ":")), event["payload_hash"]))
+db.execute("update meta set value='2' where key='next_sequence'")
+db.commit()
+PY
+"$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store"
+"$bin_dir/sw-agentd" status --store "$tmp/agent-store" >"$tmp/agent-disabled-status.json"
+python3 - "$tmp/agent-disabled-status.json" "$tmp/server.sqlite" <<'PY'
+import json, sqlite3, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["policy_status"] == "VALIDATED" and not status["telemetry_enabled"] and status["queued"] == 1, status
+db = sqlite3.connect(sys.argv[2])
+assert db.execute("select count(*) from events").fetchone()[0] == 2
+PY
+
+publish_policy_update 5 true 0
+sync_policy "$tmp/agent-store" >"$tmp/agent-policy-sampled-out.json"
+"$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store"
+"$bin_dir/sw-agentd" status --store "$tmp/agent-store" >"$tmp/agent-sampled-status.json"
+python3 - "$tmp/agent-sampled-status.json" "$tmp/server.sqlite" <<'PY'
+import json, sqlite3, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["policy_status"] == "ACTIVE" and status["telemetry_enabled"] and status["sample_rate"] == 0 and status["queued"] == 0, status
+db = sqlite3.connect(sys.argv[2])
+assert db.execute("select count(*) from events").fetchone()[0] == 3
+PY
+
+publish_policy_update 6 true 1
 
 mkdir "$tmp/allowed-root/nested" "$tmp/outside-root"
 ln -s "$tmp/outside-root" "$tmp/allowed-root/external-link"
@@ -369,6 +470,25 @@ expect_policy_rejected fractional-revision "$tmp/allowed-root" 2099-01-01T00:00:
     SEA_POLICY_REVISION_INVALID
 expect_policy_rejected unsafe-revision "$tmp/allowed-root" 2099-01-01T00:00:00Z 9007199254740992 \
     SEA_POLICY_REVISION_INVALID
+python3 - "$tmp/policy.json" "$tmp/policy-unauthorized-action.json" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+policy["allowed_actions"] = ["monitor.roots.configure"]
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(policy, separators=(",", ":")))
+PY
+openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$tmp/policy-unauthorized-action.json" \
+    -out "$tmp/policy-unauthorized-action.sig"
+if "$bin_dir/sw-agentd" validate-policy --store "$tmp/policy-store-unauthorized-action" \
+    --file "$tmp/policy-unauthorized-action.json" --signature "$tmp/policy-unauthorized-action.sig" \
+    --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant --root "$tmp/allowed-root" \
+    >"$tmp/policy-unauthorized-action.out" 2>&1; then
+    echo "policy with unauthorized telemetry setting was accepted" >&2
+    exit 1
+fi
+grep -q 'requires telemetry.configure' "$tmp/policy-unauthorized-action.out" || {
+    cat "$tmp/policy-unauthorized-action.out" >&2
+    exit 1
+}
 python3 - "$tmp/policy-store/spool.sqlite" "$tmp/policy.json" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
@@ -396,6 +516,7 @@ set -e
 grep -q 'SEA_POLICY_ROLLBACK' "$tmp/policy-replay.out"
 
 # A non-success HTTP status must never be interpreted as an event acknowledgement.
+sync_policy "$tmp/conflict-agent-store" >/dev/null
 "$bin_dir/sw-agentd" status --store "$tmp/conflict-agent-store" >/dev/null
 python3 - "$tmp/conflict-agent-store/spool.sqlite" <<'PY'
 import hashlib, json, sqlite3, sys
@@ -408,7 +529,7 @@ db.commit()
 PY
 set +e
 "$bin_dir/sw-agentd" flush --endpoint 127.0.0.1 --port "$port" \
-    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
     --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/conflict-agent-store" \
     >"$tmp/conflict-agent.log" 2>&1
 rc=$?
@@ -423,12 +544,13 @@ assert status["queued"] == 1, status
 PY
 
 # Keep an event durable while the server is offline, then deliver it after restart.
+sync_policy "$tmp/offline-agent-store" >/dev/null
 kill "$server_pid"
 wait "$server_pid" || true
 server_pid=
 set +e
 "$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
-    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
     --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/offline-agent-store" \
     >"$tmp/offline-agent.log" 2>&1
 rc=$?
@@ -470,7 +592,7 @@ else:
     raise SystemExit("restarted mTLS server did not become ready: " + str(last))
 PY
 "$bin_dir/sw-agentd" flush --endpoint 127.0.0.1 --port "$port" \
-    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
     --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/offline-agent-store"
 "$bin_dir/sw-agentd" status --store "$tmp/offline-agent-store" >"$tmp/offline-after-restart.json"
 python3 - "$tmp/offline-after-restart.json" "$tmp/server.sqlite" <<'PY'
@@ -478,7 +600,7 @@ import json, sqlite3, sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 assert status["queued"] == 0, status
 db = sqlite3.connect(sys.argv[2])
-assert db.execute("select count(*) from events").fetchone()[0] == 3
+assert db.execute("select count(*) from events").fetchone()[0] == 4
 PY
 
 kill "$server_pid"

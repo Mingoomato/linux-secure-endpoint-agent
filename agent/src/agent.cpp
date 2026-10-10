@@ -39,12 +39,23 @@ namespace {
 using agent::json::Value;
 using agent::json::Array;
 struct Config {
-    std::string host = "127.0.0.1", port = "8443", agent_id, ca, cert, key, store;
+    std::string host = "127.0.0.1", port = "8443", agent_id, ca, cert, key, store, tenant;
 };
 struct Queued {
     std::string id, observed, payload, hash;
     std::uint64_t sequence = 0;
 };
+struct RuntimePolicy {
+    bool present = false;
+    bool expired = false;
+    bool telemetry_enabled = false;
+    std::uint64_t revision = 0;
+    double sample_rate = 0.0;
+    std::size_t monitored_root_count = 0;
+    std::string issuer;
+    std::string tenant;
+};
+RuntimePolicy active_policy(sqlite3 *db, const std::string &expected_tenant, bool require_scope);
 volatile sig_atomic_t stopping = 0;
 void stop_signal(int sig) { (void)sig; stopping = 1; }
 
@@ -196,6 +207,25 @@ void enqueue(sqlite3 *db, const std::string &event_id, std::uint64_t sequence, c
     sqlite3_bind_text(s, 5, payload_hash.c_str(), -1, SQLITE_TRANSIENT);
     sql_check(sqlite3_step(s), db, "enqueue event");
     sqlite3_finalize(s);
+}
+bool enqueue_synthetic_if_enabled(sqlite3 *db, const std::string &tenant) {
+    const RuntimePolicy policy = active_policy(db, tenant, true);
+    if (!policy.telemetry_enabled || policy.sample_rate <= 0.0) return false;
+    if (policy.sample_rate < 1.0) {
+        std::array<unsigned char, 8> random_bytes {};
+        if (RAND_bytes(random_bytes.data(), static_cast<int>(random_bytes.size())) != 1)
+            throw std::runtime_error("secure random sampling failed");
+        std::uint64_t random_value = 0;
+        for (unsigned char byte : random_bytes) random_value = (random_value << 8U) | byte;
+        constexpr std::uint64_t kSampleRange = 1ULL << 53U;
+        const std::uint64_t sample = random_value >> 11U;
+        const auto threshold = static_cast<std::uint64_t>(
+            std::floor(policy.sample_rate * static_cast<double>(kSampleRange)));
+        if (sample >= threshold) return false;
+    }
+    const std::uint64_t sequence = next_sequence(db);
+    enqueue(db, uuid(), sequence, now_iso());
+    return true;
 }
 std::vector<Queued> pending(sqlite3 *db, std::size_t limit) {
     sqlite3_stmt *s = nullptr;
@@ -474,6 +504,11 @@ int flush(sqlite3 *db, const Config &c) {
     std::vector<std::string> acked;
     unsigned attempt = 0;
     while (true) {
+        const RuntimePolicy policy = active_policy(db, c.tenant, true);
+        if (!policy.telemetry_enabled) {
+            std::cout << "flush_paused=policy_inactive\n";
+            return 0;
+        }
         auto batch = pending(db, 100);
         if (batch.empty()) break;
         try {
@@ -521,6 +556,99 @@ std::time_t parse_policy_time(const std::string &value, const char *field) {
         normalized.tm_min != requested.tm_min || normalized.tm_sec != requested.tm_sec)
         throw std::runtime_error(std::string("policy ") + field + " invalid");
     return epoch;
+}
+RuntimePolicy active_policy(sqlite3 *db, const std::string &expected_tenant, bool require_scope) {
+    sqlite3_stmt *statement = nullptr;
+    sql_check(sqlite3_prepare_v2(db,
+        "SELECT issuer,revision,document FROM policy_state ORDER BY rowid DESC LIMIT 1", -1, &statement, nullptr),
+        db, "active policy read prepare");
+    const int rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(statement);
+        return {};
+    }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(statement);
+        throw std::runtime_error("active policy read failed");
+    }
+    RuntimePolicy policy;
+    policy.present = true;
+    const auto *stored_issuer_bytes = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+    const int stored_issuer_length = sqlite3_column_bytes(statement, 0);
+    const sqlite3_int64 stored_revision = sqlite3_column_int64(statement, 1);
+    const auto *document_bytes = static_cast<const char *>(sqlite3_column_blob(statement, 2));
+    const int document_length = sqlite3_column_bytes(statement, 2);
+    if (!stored_issuer_bytes || stored_issuer_length <= 0 || stored_issuer_length > 128 ||
+        stored_revision < 1 || !document_bytes || document_length <= 0 || document_length > 65536) {
+        sqlite3_finalize(statement);
+        throw std::runtime_error("active policy state is corrupt");
+    }
+    policy.issuer.assign(stored_issuer_bytes, static_cast<std::size_t>(stored_issuer_length));
+    policy.revision = static_cast<std::uint64_t>(stored_revision);
+    const std::string document(document_bytes, static_cast<std::size_t>(document_length));
+    sqlite3_finalize(statement);
+
+    const Value root = agent::json::Parser(document).parse();
+    const Value *schema_value = root.get("schema_version");
+    if (!schema_value || schema_value->string_or() != "policy.v1")
+        throw std::runtime_error("active policy schema is corrupt");
+    const Value *issuer_value = root.get("issuer");
+    const Value *tenant_value = root.get("tenant_scope");
+    const Value *revision_value = root.get("revision");
+    const double document_revision = revision_value ? revision_value->number_or(-1.0) : -1.0;
+    constexpr double kMaxSafeStoredRevision = 9007199254740991.0;
+    if (!issuer_value || !tenant_value || !revision_value || issuer_value->string_or() != policy.issuer ||
+        tenant_value->string_or().empty() || document_revision < 1.0 ||
+        document_revision > kMaxSafeStoredRevision || std::floor(document_revision) != document_revision ||
+        document_revision != static_cast<double>(policy.revision))
+        throw std::runtime_error("active policy scope is corrupt");
+    policy.tenant = tenant_value->string_or();
+    if (require_scope && expected_tenant.empty())
+        throw std::runtime_error("SEA_SCOPE_INVALID: --tenant is required to apply policy");
+    if (!expected_tenant.empty() && policy.tenant != expected_tenant)
+        throw std::runtime_error("SEA_SCOPE_INVALID: stored policy tenant mismatch");
+
+    const Value *expiry_value = root.get("expires_at");
+    const std::time_t expiry = parse_policy_time(expiry_value ? expiry_value->string_or() : "", "expires_at");
+    policy.expired = expiry <= std::time(nullptr);
+    const Value *settings_value = root.get("settings");
+    const auto *settings = settings_value ? std::get_if<agent::json::Object>(&settings_value->data) : nullptr;
+    if (!settings) throw std::runtime_error("active policy settings are corrupt");
+    const Value *actions_value = root.get("allowed_actions");
+    const auto *actions = actions_value ? std::get_if<Array>(&actions_value->data) : nullptr;
+    if (!actions) throw std::runtime_error("active policy actions are corrupt");
+    const bool telemetry_action = std::any_of(actions->begin(), actions->end(), [](const Value &action) {
+        return action.string_or() == "telemetry.configure";
+    });
+    const bool roots_action = std::any_of(actions->begin(), actions->end(), [](const Value &action) {
+        return action.string_or() == "monitor.roots.configure";
+    });
+    const Value *telemetry_value = settings_value->get("telemetry_enabled");
+    if (telemetry_value) {
+        const auto *enabled = std::get_if<bool>(&telemetry_value->data);
+        if (!enabled || !telemetry_action) throw std::runtime_error("active policy telemetry setting is corrupt");
+        policy.telemetry_enabled = *enabled;
+    }
+    const Value *sample_value = settings_value->get("sample_rate");
+    if (sample_value) {
+        if (!telemetry_action) throw std::runtime_error("active policy sampling action is missing");
+        policy.sample_rate = sample_value->number_or(-1.0);
+        if (!std::isfinite(policy.sample_rate) || policy.sample_rate < 0.0 || policy.sample_rate > 1.0)
+            throw std::runtime_error("active policy sample-rate setting is corrupt");
+    }
+    const Value *roots_value = settings_value->get("monitored_roots");
+    if (roots_value) {
+        if (!roots_action) throw std::runtime_error("active policy roots action is missing");
+        const auto *roots = std::get_if<Array>(&roots_value->data);
+        if (!roots || roots->size() > 32U)
+            throw std::runtime_error("active policy monitored-roots setting is corrupt");
+        for (const auto &path : *roots) {
+            if (path.string_or().empty()) throw std::runtime_error("active policy monitored root is corrupt");
+        }
+        policy.monitored_root_count = roots->size();
+    }
+    if (policy.expired) policy.telemetry_enabled = false;
+    return policy;
 }
 bool validate_policy_document(const Config &c, const std::string &document, const std::string &signature,
                               const std::string &pubfile, const std::string &tenant,
@@ -579,10 +707,18 @@ bool validate_policy_document(const Config &c, const std::string &document, cons
     const auto *actions = actions_v ? std::get_if<Array>(&actions_v->data) : nullptr;
     if (!actions || actions->empty() || actions->size() > 8U)
         throw std::runtime_error("allowed_actions must be a bounded non-empty array");
+    bool telemetry_action = false;
+    bool roots_action = false;
+    std::vector<std::string> seen_actions;
     for (const auto &action : *actions) {
         std::string name = action.string_or();
         if (name != "telemetry.configure" && name != "monitor.roots.configure")
             throw std::runtime_error("policy action rejected: " + name);
+        if (std::find(seen_actions.begin(), seen_actions.end(), name) != seen_actions.end())
+            throw std::runtime_error("duplicate policy action rejected");
+        seen_actions.push_back(name);
+        telemetry_action = telemetry_action || name == "telemetry.configure";
+        roots_action = roots_action || name == "monitor.roots.configure";
     }
     const Value *settings = root.get("settings");
     const auto *setting_obj = settings ? std::get_if<agent::json::Object>(&settings->data) : nullptr;
@@ -596,11 +732,14 @@ bool validate_policy_document(const Config &c, const std::string &document, cons
         throw std::runtime_error("configured policy root must be an existing directory");
     for (const auto &[name, value] : *setting_obj) {
         if (name == "telemetry_enabled") {
+            if (!telemetry_action) throw std::runtime_error("telemetry setting requires telemetry.configure");
             if (!std::get_if<bool>(&value.data)) throw std::runtime_error("telemetry_enabled must be boolean");
         } else if (name == "sample_rate") {
+            if (!telemetry_action) throw std::runtime_error("sample_rate requires telemetry.configure");
             double rate = value.number_or(-1);
             if (rate < 0 || rate > 1) throw std::runtime_error("sample_rate out of range");
         } else if (name == "monitored_roots") {
+            if (!roots_action) throw std::runtime_error("monitored_roots requires monitor.roots.configure");
             const auto *roots = std::get_if<Array>(&value.data);
             if (!roots || roots->size() > 32U) throw std::runtime_error("monitored_roots must be a bounded array");
             for (const auto &r : *roots) {
@@ -792,14 +931,33 @@ int main(int argc, char **argv) {
         c.cert = arg(argc, argv, "--cert");
         c.key = arg(argc, argv, "--key");
         c.store = arg(argc, argv, "--store");
+        c.tenant = arg(argc, argv, "--tenant");
         if (command == "status") {
-            sqlite3 *db = open_queue(c.store);
+            std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
+            sqlite3 *db = database.get();
             sqlite3_stmt *s = nullptr;
-            sqlite3_prepare_v2(db, "SELECT count(*),COALESCE(sum(length(payload)),0) FROM queue", -1, &s, nullptr);
-            sqlite3_step(s);
-            std::cout << "{\"state\":\"OFFLINE_QUEUEING\",\"queued\":" << sqlite3_column_int(s,0)
-                      << ",\"bytes\":" << sqlite3_column_int64(s,1) << "}\n";
-            sqlite3_finalize(s); sqlite3_close(db); return 0;
+            sql_check(sqlite3_prepare_v2(db, "SELECT count(*),COALESCE(sum(length(payload)),0) FROM queue", -1, &s, nullptr),
+                db, "status queue prepare");
+            const int rc = sqlite3_step(s);
+            if (rc != SQLITE_ROW) {
+                sqlite3_finalize(s);
+                throw std::runtime_error("status queue read failed");
+            }
+            const int queued = sqlite3_column_int(s, 0);
+            const sqlite3_int64 bytes = sqlite3_column_int64(s, 1);
+            sqlite3_finalize(s);
+            const RuntimePolicy policy = active_policy(db, c.tenant, false);
+            const char *policy_status = !policy.present ? "NO_POLICY" :
+                (policy.expired ? "STALE" : (policy.telemetry_enabled ? "ACTIVE" : "VALIDATED"));
+            std::cout << "{\"state\":\"" << policy_status << "\",\"policy_status\":\"" << policy_status
+                      << "\",\"policy_revision\":";
+            if (policy.present) std::cout << policy.revision;
+            else std::cout << "null";
+            std::cout << ",\"telemetry_enabled\":" << (policy.telemetry_enabled ? "true" : "false")
+                      << ",\"sample_rate\":" << policy.sample_rate
+                      << ",\"monitored_root_count\":" << policy.monitored_root_count
+                      << ",\"queued\":" << queued << ",\"bytes\":" << bytes << "}\n";
+            return 0;
         }
         if (command == "doctor" || command == "enroll") {
             if (!is_loopback(c.host)) throw std::runtime_error("SEA_SCOPE_INVALID: endpoint must be loopback");
@@ -820,11 +978,10 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (command != "flush" && command != "run") throw std::runtime_error("unknown command");
-        sqlite3 *db = open_queue(c.store);
-        if (command == "run" || flag(argc, argv, "--synthetic")) {
-            std::uint64_t seq = next_sequence(db);
-            enqueue(db, uuid(), seq, now_iso());
-        }
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
+        sqlite3 *db = database.get();
+        if (command == "run" || flag(argc, argv, "--synthetic"))
+            (void)enqueue_synthetic_if_enabled(db, c.tenant);
         signal(SIGINT, stop_signal); signal(SIGTERM, stop_signal);
         std::string pidfile = arg(argc, argv, "--pidfile");
         if (command == "run" && !pidfile.empty()) write_pidfile(pidfile);
@@ -836,10 +993,9 @@ int main(int argc, char **argv) {
             if (interval == 0 || stopping) break;
             for (int i = 0; i < interval && !stopping; ++i)
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (!stopping) enqueue(db, uuid(), next_sequence(db), now_iso());
+            if (!stopping) (void)enqueue_synthetic_if_enabled(db, c.tenant);
         } while (!stopping);
         if (!pidfile.empty()) unlink(pidfile.c_str());
-        sqlite3_close(db);
         return rc;
     } catch (const std::exception &e) {
         std::cerr << "sw-agentd: " << e.what() << '\n'; return 2;

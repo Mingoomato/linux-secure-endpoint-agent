@@ -65,7 +65,7 @@
 47. Agent가 304 응답을 받았지만 local last-good document가 없다고 주장하는 상황은 어떤 데이터 일관성 위반이며, 왜 조용히 성공 처리하면 안 되나요?
 48. policy document가 server DB에 저장된 뒤 signature key가 교체되면 기존 정책의 fetch와 검증은 어떻게 영향을 받나요? key versioning/rotation을 어떻게 설계할까요?
 49. Server의 policy row 갱신과 Agent의 last-good/audit 갱신이 서로 다른 DB transaction인 이유는 무엇이며, 네트워크 장애가 발생해도 어떤 불변 조건이 남아야 하나요?
-50. 현재 `policy_state`에 저장된 `telemetry_enabled` 값이 실제 event 생성에 영향을 주는지 코드에서 추적하세요. 저장 상태와 runtime 효과가 다를 때 운영 상태 응답은 어떻게 표현해야 하나요?
+50. `active_policy`, `enqueue_synthetic_if_enabled`, `flush`를 따라가며 no-policy, stale, telemetry-disabled 상태가 이벤트 생성과 queue 전송에 미치는 차이를 설명하세요. `status`는 이 상태를 어떤 필드로 보여주나요?
 51. ETag가 문서 SHA-256만 포함할 때 signature key ID나 policy issuer가 바뀌면 캐시 동작은 충분한가요? 더 강한 validator를 만들려면 어떤 식별자를 포함해야 하나요?
 52. `If-None-Match` 파서가 중복 헤더를 거부하는 선택과 HTTP 표준의 여러 ETag 문법을 구현하는 선택을 어떤 기준으로 비교하나요?
 53. 서버 단일 처리 loop에서 정책 publish와 telemetry ingestion이 동시에 밀릴 때 지연과 backpressure를 어떤 지표로 보이고 어떻게 제한할까요?
@@ -75,3 +75,5 @@
 Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변을 관찰한 뒤에만 평가합니다. 현재 소유자 학습·재현 상태는 **관찰되지 않음**입니다.
 
 56. `--request-deadline-ms`의 허용 범위가 100–60,000 ms인 이유를 설계 관점에서 설명하고, 값이 최소·최대 경계를 벗어날 때 server가 어떻게 동작하는지 검증하려면 어떤 CLI 시험을 추가하겠습니까?
+
+57. `sample_rate=0`일 때 기존 queue를 flush하면서 새 event는 만들지 않는 이유를 코드로 증명하세요. 0과 1 사이의 표본은 어떤 난수 입력과 정수 범위에서 만들어지며, `RAND_bytes` 실패 시 어떤 안전한 동작을 해야 하나요?
