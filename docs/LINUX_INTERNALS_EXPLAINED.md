@@ -6,7 +6,7 @@ Agent는 `getaddrinfo`로 주소를 찾고 loopback 주소만 남긴 뒤 `socket
 
 TCP는 메시지 경계가 없는 순서 있는 byte stream입니다. 한 번의 `send`가 상대편 한 번의 `recv`로 대응한다고 가정할 수 없습니다. 이 프로젝트는 HTTP header 끝과 Content-Length로 application 메시지 경계를 만듭니다. Server는 header 16 KiB, body 1 MiB를 상한으로 두고 ambiguous framing을 거부합니다.
 
-`SO_RCVTIMEO`와 `SO_SNDTIMEO`는 개별 block I/O 대기시간을 설정하는 socket option입니다. 현재 server는 accepted socket에 5초를 적용합니다. 이는 완전한 session deadline이 아니며, 여러 번의 부분 데이터가 시간 내 도착하면 총 처리시간이 더 길 수 있습니다. 순차 server의 느린 client 문제를 전부 해결하지도 않습니다.
+`SO_RCVTIMEO`와 `SO_SNDTIMEO`는 개별 block I/O 대기시간을 설정하는 socket option입니다. 현재 server는 accepted socket에 5초를 적용하고, TLS handshake 뒤 HTTP request read에는 `std::chrono::steady_clock`으로 계산하는 별도의 총 deadline을 둡니다. 기본값은 10초이며 `--request-deadline-ms`에서 100–60,000 ms로 설정합니다. 매번 read할 때 남은 deadline과 5초 중 짧은 timeout을 적용하므로, 조금씩 byte를 보내 개별 timeout을 계속 갱신하려는 client도 HTTP request 수명을 무한히 늘릴 수 없습니다. TLS handshake 자체는 아직 개별 I/O timeout만 가지며 절대 handshake deadline은 아닙니다. 순차 server의 동시성·rate limit 문제도 별도로 남습니다.
 
 ## Socket 위의 TLS
 
@@ -22,7 +22,7 @@ Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subs
 
 이 정책은 여러 proxy/parser가 같은 byte stream을 다른 길이로 해석하는 상황을 줄이기 위한 것입니다. RFC의 모든 헤더 규칙·상태코드별 body semantics·chunked encoding을 지원하지 않습니다. 그러므로 custom parser를 인터넷 노출 서버에 재사용하면 안 됩니다. 현재 loopback 제한과 테스트는 lab scope의 경계입니다.
 
-`SSL_read`는 TLS application bytes를 돌려주며 한 호출이 한 HTTP 요청과 대응하지 않습니다. `read_request`가 이를 `std::string`에 누적하고, `parse_request_head`가 CRLF delimiter를 찾은 뒤 Content-Length와 제한을 검사합니다. head가 끝나지 않은 상태는 `nullopt`로 표현되어 더 읽을 수 있고, 완성된 `Request`에는 입력 `string_view`를 남기지 않고 소유형 문자열을 복사합니다. 따라서 view는 parser 호출 안에서만 유효하고, 이후 TLS buffer 재사용과 분리됩니다.
+`SSL_read`는 TLS application bytes를 돌려주며 한 호출이 한 HTTP 요청과 대응하지 않습니다. `read_request`가 이를 `std::string`에 누적하고, `parse_request_head`가 CRLF delimiter를 찾은 뒤 Content-Length와 제한을 검사합니다. head가 끝나지 않은 상태는 `nullopt`로 표현되어 더 읽을 수 있고, 완성된 `Request`에는 입력 `string_view`를 남기지 않고 소유형 문자열을 복사합니다. 이 함수는 handshake 완료 뒤 만들어진 단조 시계 deadline을 매 read 전에 확인하고, socket receive timeout을 남은 시간에 맞춰 줄입니다. 따라서 view는 parser 호출 안에서만 유효하고, 이후 TLS buffer 재사용과 분리됩니다.
 
 `tests/http_parser_test.cpp`는 TLS 연결 없이 경계 조건을 회귀 검사합니다. 선택형 libFuzzer harness는 parser에 임의 바이트를 직접 전달하고, malformed request의 예외는 정상적인 입력 거부로 취급합니다. Clang libFuzzer+ASan+UBSan 100,000회 개발 실행은 실패 없이 완료되었지만, 이는 특정 seed와 짧은 실행의 결과입니다. 전체 RFC 문법, 장시간 안정성, server concurrency나 TLS 상태 전이를 보증하지 않습니다.
 

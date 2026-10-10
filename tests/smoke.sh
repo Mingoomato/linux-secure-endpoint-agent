@@ -24,7 +24,7 @@ port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); p
     --cert "$certs/server.crt" --key "$certs/server.key" --ca "$certs/ca.crt" \
     --agents "$certs/agents.txt" --operators "$certs/operators.txt" \
     --admin-token-file "$tmp/admin-token" --policy-key "$certs/policy-signing.key" \
-    --tenant smoke-tenant --db "$tmp/server.sqlite" >"$tmp/server.log" 2>&1 &
+    --tenant smoke-tenant --request-deadline-ms 1500 --db "$tmp/server.sqlite" >"$tmp/server.log" 2>&1 &
 server_pid=$!
 python3 - "$certs" "$port" <<'PY'
 import socket, ssl, sys, time
@@ -47,6 +47,35 @@ for _ in range(100):
 else:
     raise SystemExit("mTLS health check did not become ready: " + str(last))
 PY
+
+python3 - "$certs" "$port" <<'PY'
+import select, socket, ssl, sys, time
+certs, port = sys.argv[1], int(sys.argv[2])
+ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+ctx.load_cert_chain(certs + "/agent.crt", certs + "/agent.key")
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="127.0.0.1") as sock:
+    start = time.monotonic()
+    response = bytearray()
+    sock.sendall(b"G")
+    while time.monotonic() - start < 3.0:
+        ready, _, _ = select.select([sock], [], [], 0.05)
+        if ready:
+            try:
+                chunk = sock.recv(4096)
+            except (OSError, ssl.SSLError):
+                break
+            if not chunk: break
+            response.extend(chunk)
+        else:
+            try:
+                sock.sendall(b"G")
+            except (OSError, ssl.SSLError):
+                break
+    elapsed = time.monotonic() - start
+assert not response or response.startswith(b"HTTP/1.1 400 "), response
+assert 1.0 <= elapsed < 3.0, elapsed
+PY
+grep -q 'HTTP request absolute deadline exceeded' "$tmp/server.log"
 
 "$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
     --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
@@ -417,7 +446,7 @@ PY
     --cert "$certs/server.crt" --key "$certs/server.key" --ca "$certs/ca.crt" \
     --agents "$certs/agents.txt" --operators "$certs/operators.txt" \
     --admin-token-file "$tmp/admin-token" --policy-key "$certs/policy-signing.key" \
-    --tenant smoke-tenant --db "$tmp/server.sqlite" >"$tmp/server-restart.log" 2>&1 &
+    --tenant smoke-tenant --request-deadline-ms 1500 --db "$tmp/server.sqlite" >"$tmp/server-restart.log" 2>&1 &
 server_pid=$!
 python3 - "$certs" "$port" <<'PY'
 import socket, ssl, sys, time

@@ -20,11 +20,11 @@
 
 `server/src/server.cpp`의 `run_server`가 인증서와 allowlist, SQLite DB를 열고 loopback listener를 만듭니다. `accept4`가 연결마다 close-on-exec FD를 주며, 순차 accept loop가 `serve_one`을 호출합니다.
 
-`serve_one`은 accepted socket에 5초 receive/send timeout을 설정하고 TLS handshake를 진행합니다. client certificate chain을 확인한 뒤 `peer_cn`의 CN이 agent 또는 operator allowlist 중 적절한 역할에 있는지 확인합니다. 따라서 mTLS 연결을 맺었다는 것만으로 애플리케이션 권한이 생기지 않습니다.
+`serve_one`은 accepted socket에 5초 receive/send timeout을 설정하고 TLS handshake를 진행합니다. client certificate chain을 확인한 뒤 `peer_cn`의 CN이 agent 또는 operator allowlist 중 적절한 역할에 있는지 확인합니다. 따라서 mTLS 연결을 맺었다는 것만으로 애플리케이션 권한이 생기지 않습니다. TLS handshake와 CN allowlist 확인이 끝난 뒤 `std::chrono::steady_clock`으로 HTTP request header/body read deadline을 시작하며, 기본값은 10초이고 `--request-deadline-ms`로 100–60,000 ms 범위에서 조절합니다. 이 옵션은 handshake와 route 처리에는 적용되지 않습니다.
 
 HTTP 문법은 `server/include/agent/http.hpp`에 있는 순수 함수로 분리되어 있습니다. `parse_request_head`는 header delimiter가 아직 도착하지 않았으면 `nullopt`를 반환하고, 완성되면 `RequestHead`에 header 크기와 선언 body 길이를 둡니다. `parse_request`는 framing 길이가 정확히 맞을 때 body를 복사해 소유형 `Request`를 만듭니다. `read_request`는 TLS `SSL_read` 조각을 누적하고 이 두 함수를 이용해 요청이 완성될 때까지 읽습니다. request line은 origin-form path와 HTTP/1.1만 허용합니다. header는 최대 16 KiB, body는 1 MiB이며 Host 한 개를 요구하고 POST에는 단일 Content-Length를 요구합니다. event batch endpoint는 `application/json` Content-Type 한 개를 확인합니다. Transfer-Encoding, 중복 Content-Length/Content-Type, GET body, 잘못된 header와 초과 바이트는 처리하지 않습니다.
 
-경로 분기 뒤 event batch는 `ingest`로 갑니다. `ingest`가 JSON batch version, 인증서 identity와 body의 agent ID, 이벤트 수, 민감 키, payload hash를 검증합니다. SQLite transaction은 event ID 고유성으로 중복을 잡습니다. 같은 ID의 sequence와 hash가 동일하면 duplicate ACK에 추가하고, 내용이 다르면 rollback/error가 됩니다. DB commit이 끝난 뒤에만 응답을 작성합니다.
+`read_request`는 남은 deadline과 최대 5초 중 짧은 시간을 다음 socket read에 적용하고, 단조 시계 deadline을 넘기면 요청을 거부합니다. 테스트는 TLS와 CN allowlist 검증을 마친 client가 요청의 한 byte만 간격을 두고 보내도 1.5초 설정 deadline 뒤 연결이 종료되는지 확인합니다. 이 deadline은 HTTP header/body 수신만 제한하며 TLS handshake, route 처리, 전체 server connection lifecycle을 제한하지 않습니다. 경로 분기 뒤 event batch는 `ingest`로 갑니다. `ingest`가 JSON batch version, 인증서 identity와 body의 agent ID, 이벤트 수, 민감 키, payload hash를 검증합니다. SQLite transaction은 event ID 고유성으로 중복을 잡습니다. 같은 ID의 sequence와 hash가 동일하면 duplicate ACK에 추가하고, 내용이 다르면 rollback/error가 됩니다. DB commit이 끝난 뒤에만 응답을 작성합니다.
 
 ## 4. Policy 게시·fetch·검증·저장
 

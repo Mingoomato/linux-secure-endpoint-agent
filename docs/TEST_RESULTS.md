@@ -16,13 +16,13 @@
 | GCC 16.2 및 Clang 21.1.8 AddressSanitizer + UndefinedBehaviorSanitizer 빌드/CTest | 각각 4/4 통과 |
 | Agent/Server JSON parser 각각의 CTest | 통과. 숫자 grammar, JSON whitespace, 중복 key, 깊이/크기 제한 포함 |
 | loopback mTLS/policy/queue integration | 통과. event ACK/dedup/ID 충돌과 미등록 client 거부; operator certificate+bearer token 권한 분리; 새 policy 게시 201 및 동일 재게시 200; 정확한 ETag 조건부 fetch 304; agent `sync-policy`; 서명된 잘못된 higher revision의 path-scope 거부 뒤 last-good revision/audit 보존, 후속 valid revision 저장; signature tamper/replay, `..` path traversal·외부 symlink·잘못된 calendar expiry·음수/분수/unsafe revision 거부; offline queue와 재시작 후 replay 포함 |
-| HTTP framing 및 media-type 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host/Content-Type, 누락/잘못된 Content-Type, header 초과, 미완성 body timeout, HTTP 400 ACK 거부와 queue 보존 확인 |
+| HTTP framing 및 media-type 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host/Content-Type, 누락/잘못된 Content-Type, header 초과, 미완성 body timeout, 1.5초 전체 HTTP request deadline에 대한 slow-client 거부, HTTP 400 ACK 거부와 queue 보존 확인 |
 | HTTP parser 직접 단위 테스트 | 통과. 정상 GET/POST, 불완전 head/body, line/header 오류, duplicate framing, 상한, 잘림·추가 바이트 확인 |
 | Clang libFuzzer + ASan/UBSan | 기존 로컬 corpus 233개 seed를 시작점으로 `max_len=16384`에서 100,000회 완료, crash/sanitizer finding 없음. coverage 643, feature count 2,347로 끝난 짧은 개발 campaign |
 | Clang 정적 분석 | agent, server, 분리 HTTP parser 시험 코드에서 진단 없음 |
 | smoke script 구문과 `git diff --check` | 통과 |
 
-HTTP framing 시험은 TLS 연결 후 실제 server parser의 400 응답을 확인합니다. header 제한은 16 KiB, body 제한은 1 MiB, accepted socket 개별 I/O timeout은 5초입니다. Agent의 정상 200 ACK와 실제 server의 400 response 거부·queue 보존도 GCC/Clang 및 sanitizer 통합 시험에 포함됩니다. Policy conditional GET은 실제 SHA-256 ETag에 대해 304와 빈 body를 확인합니다. 별도의 mock server status matrix는 아직 없습니다.
+HTTP framing 시험은 TLS 연결 후 실제 server parser의 400 응답을 확인합니다. header 제한은 16 KiB, body 제한은 1 MiB, accepted socket 개별 I/O timeout은 5초입니다. 기본 HTTP header/body 수신 deadline은 TLS peer 및 CN allowlist 확인 뒤 시작하는 10초이며 CLI에서 100–60,000 ms로 조절합니다. 반복 slow-client는 1.5초 설정의 절대 deadline 안에 종료됐고, 이 deadline은 TLS handshake와 route 처리를 포함하지 않습니다. Agent의 정상 200 ACK와 실제 server의 400 response 거부·queue 보존도 GCC/Clang 및 sanitizer 통합 시험에 포함됩니다. Policy conditional GET은 실제 SHA-256 ETag에 대해 304와 빈 body를 확인합니다. 별도의 mock server status matrix는 아직 없습니다.
 
 ## 실행 재현 명령
 
@@ -62,7 +62,7 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 
 - 만료 server/client 인증서, 잘못된 SAN, 다른 CA, certificate rotation/revocation 및 enrollment lifecycle; malformed calendar expiry는 거부하지만 expired-policy matrix는 미검증
 - 확장 server/agent 재시작 및 장시간 offline 행렬, expiry/replay 조합, ACK 유실 fault injection (기본 offline queue와 server restart 한 경로는 smoke에서 통과)
-- full HTTP grammar, long-duration parser fuzzing, slow-client 총 session deadline, worker pool/동시 연결 부하
+- full HTTP grammar, long-duration parser fuzzing, absolute TLS handshake deadline, worker pool/동시 연결 부하
 - event/file input, queue quota·disk-full·DB write failure와 retry/backpressure 429 계약
 - production operator RBAC, certificate enrollment/rotation/revocation and denylist lifecycle
 - stored policy values applied to a runtime collector; current validation/last-good commit is not a runtime enforcement hook

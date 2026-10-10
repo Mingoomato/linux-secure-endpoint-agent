@@ -1,6 +1,6 @@
 # Requirements traceability (SRS-06)
 
-The recorded loopback integration verifies selected mTLS, separated operator authorization, policy publication/signing/fetch, ETag/304, agent sync, last-good recovery, queue, and deduplication paths. Parser tests and a seeded 100,000-run libFuzzer campaign provide limited parser evidence, not full protocol or SRS verification. Runtime policy enforcement, enrollment/revocation, performance, resource-fault, and deployment matrices remain open. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
+The recorded loopback integration verifies selected mTLS, separated operator authorization, policy publication/signing/fetch, ETag/304, agent sync, last-good recovery, queue, deduplication, and a slow-client HTTP request deadline path. Parser tests and a seeded 100,000-run libFuzzer campaign provide limited parser evidence, not full protocol or SRS verification. Runtime policy enforcement, TLS-handshake deadline, enrollment/revocation, performance, resource-fault, and deployment matrices remain open. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
 
 | Requirement | Source / artifact | Verification | Status |
 |---|---|---|---|
@@ -19,7 +19,7 @@ The recorded loopback integration verifies selected mTLS, separated operator aut
 | SEA-FR-013 | Ed25519 detached signature + tenant scope + strict issued/expiry UTC timestamps; server signs exact policy bytes | tests/smoke.sh (operator publish/fetch, signature tamper, invalid calendar date); full expiry/wrong-scope matrix pending | IN_PROGRESS |
 | SEA-FR-014 | positive integral safe revision, monotonic publish, and agent last-good DB | tests/smoke.sh (negative/fractional/unsafe revision rejection, invalid higher revision leaves prior state, next valid revision recovers); wrong-scope/expiry update matrix pending | IN_PROGRESS |
 | SEA-FR-015 | validate policy then transactionally replace last-good document and write audit row | tests/smoke.sh checks failed update preserves revision/audit and next accepted update is audited; runtime collector apply/rollback hook remains open | IN_PROGRESS |
-| SEA-FR-016 | agent registry, telemetry, heartbeat, status, health; operator-only policy publish and agent policy fetch | `tests/smoke.sh` verifies separate operator CN+bearer auth, 201/identical 200, 200/ETag 304, agent sync, plus `tests/http_parser_test.cpp`; registry lifecycle and full route/status matrix remain partial | IN_PROGRESS |
+| SEA-FR-016 | agent registry, telemetry, heartbeat, status, health; operator-only policy publish and agent policy fetch | `tests/smoke.sh` verifies separate operator CN+bearer auth, 201/identical 200, 200/ETag 304, agent sync, a 1.5-second trickle-client HTTP request deadline, plus `tests/http_parser_test.cpp`; registry lifecycle and full route/status matrix remain partial | IN_PROGRESS |
 | SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection and strict JSON parsing | parser CTests; SEA-T-012 privacy tests pending | IN_PROGRESS |
 | SEA-FR-018 | systemd units, PID stop, service controls | SEA-T-014 pending | IN_PROGRESS |
 | SEA-FR-019 | logs omit key/token/payload values | source review pending | IN_PROGRESS |

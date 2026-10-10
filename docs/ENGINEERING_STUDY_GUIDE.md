@@ -4,7 +4,7 @@
 
 이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구를 확인합니다. 추가로 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation/RBAC, policy runtime enforcement, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구를 확인합니다. 추가로 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부합니다. 1.5초로 설정한 HTTP 요청 절대 deadline 아래 slow-client가 종료되는 것도 통합 시험에서 확인합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. TLS handshake에는 아직 전체 수명 deadline이 없습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation/RBAC, policy runtime enforcement, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
@@ -37,7 +37,7 @@ GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 �
 
 1. `run_server`는 loopback 이외의 bind를 거부하고, IPv4 loopback listener와 TLS 인증서를 준비합니다.
 2. `accept4(..., SOCK_CLOEXEC)`로 연결을 받고 `serve_one`이 mTLS handshake, CA chain, client 인증서 CN과 allowlist를 확인합니다. 이 구현은 연결을 한 번에 하나씩 처리합니다.
-3. `read_request`는 TLS에서 읽은 byte 조각을 `raw` 문자열에 모읍니다. transport-independent `parse_request_head`는 header 끝을 찾고 header·body 경계를 검사해, header가 아직 불완전하면 `nullopt`를 반환합니다. `parse_request`는 선언 길이와 실제 길이가 정확히 일치할 때만 소유형 `Request`를 반환합니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. 받은 socket의 read/write timeout은 5초입니다.
+3. `read_request`는 TLS에서 읽은 byte 조각을 `raw` 문자열에 모읍니다. transport-independent `parse_request_head`는 header 끝을 찾고 header·body 경계를 검사해, header가 아직 불완전하면 `nullopt`를 반환합니다. `parse_request`는 선언 길이와 실제 길이가 정확히 일치할 때만 소유형 `Request`를 반환합니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. accepted socket의 개별 I/O timeout은 5초이며, TLS handshake가 끝난 뒤 시작하는 전체 HTTP request deadline은 기본 10초이고 `--request-deadline-ms`로 100–60,000 ms 범위에서 설정할 수 있습니다.
 4. `serve_one`은 `/v1/admin/policies`에서 operator CN allowlist와 mode-0600 token을 모두 확인하고 새 JSON 정책을 제한된 schema로 검증한 뒤 Ed25519 서명과 monotonic tenant revision을 SQLite에 저장합니다. 같은 revision과 정확히 같은 문서의 재게시만 200 idempotent 응답이며, 새 정책은 201입니다. Agent policy GET은 서명 envelope를 200으로 주고 SHA-256 ETag가 일치하면 304로 본문 전송을 생략합니다. health, status, telemetry, heartbeat 경로도 역할별로 분기합니다. `ingest`는 JSON schema, 주장된 agent ID, 인증서 identity, 이벤트 수, 민감 키, payload hash를 확인합니다.
 5. 서버는 `(agent_id,event_id)` 고유 키로 transaction에 기록하고 commit한 뒤에만 ACK를 보냅니다. 동일 sequence/hash의 재수신은 duplicate, 내용이 바뀐 ID 재사용은 오류가 됩니다.
 
@@ -48,7 +48,7 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 ## Linux 인터페이스와 자원 수명
 
 - TCP 경로는 `getaddrinfo(3)`, `socket(2)`, `setsockopt(2)`, `connect(2)`, 서버의 `bind(2)`, `listen(2)`, `accept4(2)`, 마지막 `close(2)`를 사용합니다. TCP는 메시지 경계가 없는 byte stream이므로 HTTP framing이 필요합니다.
-- `SOCK_CLOEXEC`은 실행 파일을 새 프로세스로 바꿀 때 FD 누출을 줄입니다. `SO_RCVTIMEO`/`SO_SNDTIMEO`는 block I/O 대기를 제한하지만 전체 연결 처리의 절대 deadline, 동시성 한도, 서비스 rate limit을 제공하지는 않습니다.
+- `SOCK_CLOEXEC`은 실행 파일을 새 프로세스로 바꿀 때 FD 누출을 줄입니다. `SO_RCVTIMEO`/`SO_SNDTIMEO`는 개별 block I/O 대기를 제한합니다. Server는 HTTP request read에 단조 시계 기반 절대 deadline도 적용하지만 그 시점은 TLS handshake 뒤입니다. 따라서 handshake 전체 deadline, 동시성 한도, 서비스 rate limit은 제공하지 않습니다.
 - `SSL_CTX`는 TLS 설정과 신뢰 정보를 보유하고 여러 `SSL` 세션의 기반이 됩니다. `SSL*`는 socket FD에 연결되어 handshake와 record I/O를 수행합니다. Agent와 Server의 `SSL*`는 `unique_ptr`, 양쪽 connected FD는 `ScopedFd`가 관리합니다. SQLite DB와 statement는 수동 정리 분기가 있어 예외 경로를 함께 추적해야 합니다.
 - C++ `std::string`, vector, map, parser `Value`는 자신이 소유한 메모리를 관리합니다. SQLite row를 읽을 때 statement가 유효한 동안 값을 복사해야 합니다. SQLite `sqlite3_stmt*`는 finalize 전까지 DB 자원을 점유합니다.
 - HTTP parser의 내부 `std::string_view`는 입력 `raw`가 살아 있는 동안만 사용하고, 반환 전에 method/path/body/content-type을 `std::string`으로 복사합니다. 따라서 호출자는 TLS 수신 buffer를 덮어써도 `Request`가 dangling view를 갖지 않습니다. fuzz harness도 입력을 view로 전달하고 parser 반환 뒤에 어떤 입력 포인터도 보관하지 않습니다.
@@ -56,7 +56,7 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 
 ## 동시성, 보안 가정, 실패
 
-- Agent는 한 실행 흐름에서 queue를 처리합니다. Server accept loop도 순차 처리이므로 handshake 또는 느린 요청 하나가 뒤 연결을 지연시킬 수 있습니다. 5초 socket timeout과 byte cap은 일부 대기를 묶지만 worker pool이나 종단간 deadline을 대신하지 않습니다.
+- Agent는 한 실행 흐름에서 queue를 처리합니다. Server accept loop도 순차 처리이므로 handshake 또는 느린 요청 하나가 뒤 연결을 지연시킬 수 있습니다. HTTP request deadline은 slow-client의 본문 읽기 점유 시간을 제한하지만 TLS handshake에는 총 deadline이 없고 worker pool이나 rate limit도 없습니다.
 - 가정은 로컬 OS와 DB 디렉터리, CA·정책 signing key, agent/operator allowlist, bearer-token 파일이 신뢰되고 개인키가 저장소 밖에서 보호된다는 것입니다. loopback은 외부 네트워크 노출을 줄일 뿐, 같은 호스트의 다른 프로세스를 인증하거나 격리하지 않습니다.
 - TLS chain 검증과 hostname/IP SAN 검증은 server identity를 확인합니다. Server는 client chain을 검증하고 역할별 CN allowlist를 확인합니다. operator endpoint는 bearer token도 요구하지만 이는 lab 수준의 단순 RBAC입니다. 운영 enrollment, rotation, revocation, SAN URI 기반 identity는 구현되어 있지 않습니다.
 - 오류는 인증서·SAN 오류, TLS truncation, framing 위반, JSON 오류, DB transaction 실패, quota, hash 불일치, 잘못된 ACK, policy signature·scope·revision 실패로 나뉩니다. 새 event는 network 전에 저장되므로 일시 실패에 보존되지만 queue quota 또는 disk full은 저장할 수 없습니다.

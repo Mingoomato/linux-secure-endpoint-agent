@@ -17,7 +17,7 @@
 ## Linux·메모리·실패 분석
 
 10. TCP가 메시지 경계를 제공하지 않는다는 점이 `read_request`와 `http_exchange` 구현에 어떤 영향을 주나요?
-11. `SO_RCVTIMEO` 5초 설정이 보장하는 범위와 보장하지 않는 범위를 설명하세요.
+11. `SO_RCVTIMEO` 5초 설정과 HTTP request 절대 deadline은 각각 무엇을 제한하나요? 후자는 왜 TLS handshake 전체 시간을 제한하지 않나요?
 12. 예외가 `serve_one` 안에서 발생할 때 `SSL*`와 accepted FD 수명은 어떻게 끝나나요? 잠재적인 누수 경로를 찾으세요.
 13. 어떤 SQLite statement가 finalize되지 않으면 어떤 자원이 남나요? transaction rollback이 필요한 실패 경로는 무엇인가요?
 14. sequence update와 event insert가 별도 transaction이면 process crash 뒤 어떤 DB 상태가 가능한가요?
@@ -48,7 +48,7 @@
 33. allowlist 경로에서 문자열 prefix 비교가 `..`와 symlink에 취약한 이유는 무엇이며, 현재 구현은 어떤 경로 비교를 하나요?
 34. policy의 `expires_at`에 달력상 존재하지 않는 날짜나 trailing text를 넣으면 어떤 단계에서 거부되어야 하나요? 실패한 시험은 `policy_state`에 어떤 영향을 줘야 하나요?
 35. canonical path 검사를 마친 뒤 실제 runtime monitor가 그 경로를 열기까지 남는 TOCTOU 위험은 무엇이며, 어떤 Linux 인터페이스로 줄일 수 있나요?
-36. `SO_RCVTIMEO`가 각 read를 제한해도 느린 peer가 전체 request 수명을 늘릴 수 있는 이유는 무엇인가요? 절대 deadline은 어떤 시계로 계산해야 하나요?
+36. slow-client가 조금씩 byte를 계속 보낼 때 개별 read timeout과 전체 HTTP request deadline은 어떤 차이가 있나요? 이 구현은 어떤 단조 시계와 남은 시간 계산을 사용하나요?
 37. ACK에 제출하지 않은 event ID가 포함되면 DB delete가 어떤 기준으로 제한되며, 왜 server response를 그대로 신뢰하면 안 되나요?
 38. 만료 정책을 거부하는 것과 이전 revision을 유지하는 것은 서로 어떤 별개의 불변 조건인가요?
 39. 이 저장소의 `enroll` 또는 `doctor` 응답이 실제 server-side enrollment를 증명하는지 코드에서 어떻게 판별하나요?
@@ -73,3 +73,5 @@
 55. 테스트의 operator 인증 거부·게시·재전송·304 확인만으로 operator lifecycle, token rotation, revocation이 검증되었다고 할 수 없는 이유는 무엇인가요?
 
 Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변을 관찰한 뒤에만 평가합니다. 현재 소유자 학습·재현 상태는 **관찰되지 않음**입니다.
+
+56. `--request-deadline-ms`의 허용 범위가 100–60,000 ms인 이유를 설계 관점에서 설명하고, 값이 최소·최대 경계를 벗어날 때 server가 어떻게 동작하는지 검증하려면 어떤 CLI 시험을 추가하겠습니까?

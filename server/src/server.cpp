@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cerrno>
 #include <cstdio>
@@ -126,10 +127,13 @@ bool contains_sensitive_key(const Value &v, unsigned depth=0) {
     return false;
 }
 
-agent::http::Request read_request(SSL *ssl) {
+agent::http::Request read_request(SSL *ssl, int socket_fd,
+        std::chrono::steady_clock::time_point deadline) {
     std::string raw;
     std::array<char, 8192> buffer {};
     for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) throw std::runtime_error("HTTP request absolute deadline exceeded");
         if (raw.size() > agent::http::kMaxHttpHeader + 4U + agent::http::kMaxHttpBody)
             throw std::runtime_error("HTTP request exceeds size limit");
         const std::optional<agent::http::RequestHead> head = agent::http::parse_request_head(raw);
@@ -138,8 +142,28 @@ agent::http::Request read_request(SSL *ssl) {
             if (raw.size() > expected_size) throw std::runtime_error("bytes follow the framed HTTP request");
             if (raw.size() == expected_size) return agent::http::parse_request(raw);
         }
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - now + std::chrono::milliseconds(2));
+        const auto max_io_budget = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds(5));
+        const bool deadline_limited = remaining <= max_io_budget;
+        const auto io_budget = std::min(remaining, max_io_budget);
+        const auto timeout_us = std::max<std::int64_t>(1, io_budget.count());
+        timeval receive_timeout {
+            static_cast<time_t>(timeout_us / 1000000),
+            static_cast<suseconds_t>(timeout_us % 1000000)
+        };
+        if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout)) != 0)
+            throw std::runtime_error("HTTP request deadline setup failed");
         int n = SSL_read(ssl, buffer.data(), static_cast<int>(buffer.size()));
-        if (n <= 0) throw std::runtime_error("incomplete HTTP request body");
+        const int read_errno = errno;
+        const int ssl_error = n <= 0 ? SSL_get_error(ssl, n) : SSL_ERROR_NONE;
+        if (n <= 0) {
+            if (std::chrono::steady_clock::now() >= deadline ||
+                (deadline_limited && ssl_error == SSL_ERROR_SYSCALL &&
+                    (read_errno == EAGAIN || read_errno == EWOULDBLOCK)))
+                throw std::runtime_error("HTTP request absolute deadline exceeded");
+            throw std::runtime_error("incomplete HTTP request body");
+        }
         raw.append(buffer.data(), static_cast<std::size_t>(n));
     }
 }
@@ -570,7 +594,7 @@ void ingest(sqlite3 *db, const std::set<std::string> &agents, SSL *ssl,
 
 void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<std::string> &operators,
                const std::string &admin_token, const std::string &tenant, EVP_PKEY *policy_key,
-               SSL_CTX *ctx, int fd) {
+               SSL_CTX *ctx, int fd, std::chrono::milliseconds request_deadline) {
     ScopedFd socket_fd(fd);
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx), SSL_free);
     if (!ssl) return;
@@ -587,7 +611,8 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<
         SSL_shutdown(ssl.get()); return;
     }
     try {
-        Request req = read_request(ssl.get());
+        const auto deadline = std::chrono::steady_clock::now() + request_deadline;
+        Request req = read_request(ssl.get(), socket_fd.get(), deadline);
         if (req.path == "/v1/admin/policies" && req.method == "POST") {
             if (!operators.contains(identity) || !valid_admin_authorization(req.authorization, admin_token)) {
                 respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_OPERATOR_UNAUTHORIZED\"}");
@@ -655,6 +680,10 @@ int run_server(int argc, char **argv) {
     std::string dbfile = arg(argc, argv, "--db", "./server.sqlite");
     int port = std::stoi(arg(argc, argv, "--port", "8443"));
     if (port < 1024 || port > 65535) throw std::runtime_error("invalid listen port");
+    const int request_deadline_ms = std::stoi(arg(argc, argv, "--request-deadline-ms", "10000"));
+    if (request_deadline_ms < 100 || request_deadline_ms > 60000)
+        throw std::runtime_error("request deadline must be between 100 and 60000 ms");
+    const auto request_deadline = std::chrono::milliseconds(request_deadline_ms);
     std::set<std::string> agents = read_allowlist(agents_file);
     std::set<std::string> operators = read_allowlist(operators_file);
     if (tenant.empty() || tenant.size() > 128U) throw std::runtime_error("--tenant must be configured");
@@ -692,7 +721,8 @@ int run_server(int argc, char **argv) {
     sigemptyset(&action.sa_mask);
     (void)sigaction(SIGINT, &action, nullptr);
     (void)sigaction(SIGTERM, &action, nullptr);
-    std::cout << "sw-server listening on 127.0.0.1:" << port << " (mTLS, lab only)\n";
+    std::cout << "sw-server listening on 127.0.0.1:" << port << " (mTLS, lab only; request deadline "
+              << request_deadline_ms << " ms)\n";
     while (!stopping) {
         sockaddr_storage peer {};
         socklen_t peer_len = sizeof(peer);
@@ -702,7 +732,7 @@ int run_server(int argc, char **argv) {
             continue;
         }
         if (fd < 0) break;
-        serve_one(db, agents, operators, admin_token, tenant, policy_key.get(), ctx, fd);
+        serve_one(db, agents, operators, admin_token, tenant, policy_key.get(), ctx, fd, request_deadline);
     }
     close(listener); sqlite3_close(db); SSL_CTX_free(ctx);
     return 0;
@@ -713,7 +743,8 @@ int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
             std::cout << "sw-server run --cert FILE --key FILE --ca FILE --agents FILE --operators FILE "
-                         "--admin-token-file FILE --policy-key FILE --tenant ID [--db FILE --port N]\n";
+                         "--admin-token-file FILE --policy-key FILE --tenant ID "
+                         "[--db FILE --port N --request-deadline-ms N]\n";
             return argc < 2 ? 2 : 0;
         }
         if (std::string(argv[1]) != "run") throw std::runtime_error("unknown command");

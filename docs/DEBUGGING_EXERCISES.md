@@ -22,15 +22,15 @@ Loopback TLS test double을 추가하거나 최소한의 ACK 처리 단위를 �
 
 **완료 기준:** 실패한 정책 시도 전후의 last-good DB 값이 같고, 새 유효 revision이 정상적으로 저장된다는 자동 검증이 있습니다.
 
-## 실습 3 — 요청 전체의 절대 deadline
+## 실습 3 — 큐 용량 초과와 내구성 경계
 
-**목표:** 부분 데이터를 조금씩 보내 socket의 개별 timeout을 계속 갱신하는 slow client가 한 연결을 무기한 점유하지 못하도록 제한합니다.
+**목표:** 행 수 또는 저장 byte 제한에 도달했을 때 새 event enqueue가 기존 durable row를 손상시키거나 조용히 버리지 않도록 독립 회귀 검증을 추가합니다.
 
-**시작점:** `server/src/server.cpp`의 `read_request`·`serve_one`, socket timeout 설정, loopback TLS integration harness.
+**시작점:** `agent/src/agent.cpp`의 queue quota 검사와 enqueue 경로, `tests/smoke.sh`, 임시 SQLite store.
 
-연결 시작 시 단조 시계 기준 deadline을 설정하고, header/body 일부가 반복 도착해도 같은 총 기한이 적용되도록 구현하세요. TLS loopback client가 정해진 간격으로 byte를 보내는 경우 응답 전 요청이 제한 시간 안에 종료되는지 재현하고, 정상 요청과 timeout 경계를 함께 검사하세요.
+임시 store의 한도를 작게 설정하거나 quota 검사 단위를 분리해, 행 한도와 byte 한도를 각각 경계 직전·정확히 가득 찬 상태·초과 상태로 재현하세요. 각 시도 전후에 저장된 row 수와 payload를 비교하고, server 연결이 불가능한 경우에도 이미 commit된 row가 보존되는지 확인하세요.
 
-**완료 기준:** idle timeout과 전체 요청 deadline의 차이를 검증하는 통합 시험이 있고, 시간 계산은 wall clock 변경에 영향을 받지 않습니다.
+**완료 기준:** 두 quota 경계에서 허용/거부 결과와 SQLite queue의 기존 내용이 자동 검증되고, 초과 거부가 데이터 유실이나 부분 row를 만들지 않는다는 assertion이 있습니다.
 
 ## 본인 재현 기록
 
