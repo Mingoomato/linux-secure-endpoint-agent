@@ -16,11 +16,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 certs="$tmp/certs"
 "$root_dir/scripts/create-local-ca.sh" "$certs" >/dev/null
+printf '%s\n' 'smoke-admin-token-0123456789-abcdefghijklmnopqrstuvwxyz' >"$tmp/admin-token"
+chmod 600 "$tmp/admin-token"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 
 "$bin_dir/sw-server" run --bind 127.0.0.1 --port "$port" \
     --cert "$certs/server.crt" --key "$certs/server.key" --ca "$certs/ca.crt" \
-    --agents "$certs/agents.txt" --db "$tmp/server.sqlite" >"$tmp/server.log" 2>&1 &
+    --agents "$certs/agents.txt" --operators "$certs/operators.txt" \
+    --admin-token-file "$tmp/admin-token" --policy-key "$certs/policy-signing.key" \
+    --tenant smoke-tenant --db "$tmp/server.sqlite" >"$tmp/server.log" 2>&1 &
 server_pid=$!
 python3 - "$certs" "$port" <<'PY'
 import socket, ssl, sys, time
@@ -168,6 +172,139 @@ openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$tmp/policy
 "$bin_dir/sw-agentd" validate-policy --store "$tmp/policy-store" --file "$tmp/policy.json" \
     --signature "$tmp/policy.sig" --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant --root "$tmp/allowed-root" >"$tmp/policy-ok.json"
 
+python3 - "$certs" "$port" "$tmp/admin-token" "$tmp/policy.json" <<'PY'
+import hashlib, json, socket, ssl, sys
+certs, port, token_file, policy_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+token = open(token_file, encoding="utf-8").read().strip()
+document = open(policy_file, "rb").read()
+def request(identity, method, path, body=b"", authorization=None, if_none_match=None):
+    ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+    ctx.load_cert_chain(certs + "/" + identity + ".crt", certs + "/" + identity + ".key")
+    headers = ["Host: 127.0.0.1", "Connection: close"]
+    if body:
+        headers.extend(["Content-Type: application/json", "Content-Length: " + str(len(body))])
+    if authorization:
+        headers.append("Authorization: " + authorization)
+    if if_none_match:
+        headers.append("If-None-Match: " + if_none_match)
+    raw = (method + " " + path + " HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n").encode() + body
+    with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="127.0.0.1") as sock:
+        sock.sendall(raw)
+        response = b""
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk: break
+            response += chunk
+    head, body = response.split(b"\r\n\r\n", 1)
+    status = int(head.split(b"\r\n", 1)[0].split()[1])
+    return status, body
+assert request("operator", "POST", "/v1/admin/policies", document)[0] == 403
+assert request("agent", "POST", "/v1/admin/policies", document, "Bearer " + token)[0] == 403
+status, body = request("operator", "POST", "/v1/admin/policies", document, "Bearer " + token)
+assert status == 201, (status, body)
+status, body = request("operator", "POST", "/v1/admin/policies", document, "Bearer " + token)
+assert status == 200, (status, body)
+status, body = request("agent", "GET", "/v1/agents/self/policy")
+envelope = json.loads(body)
+assert status == 200 and envelope["schema_version"] == "policy_envelope.v1"
+assert envelope["policy_document"].encode() == document
+assert len(envelope["signature_hex"]) == 128
+etag = '"' + hashlib.sha256(document).hexdigest() + '"'
+status, body = request("agent", "GET", "/v1/agents/self/policy", if_none_match=etag)
+assert status == 304 and body == b"", (status, body)
+PY
+
+sync_policy() {
+    "$bin_dir/sw-agentd" sync-policy --endpoint 127.0.0.1 --port "$port" \
+        --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+        --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/policy-sync-store" \
+        --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant --root "$tmp/allowed-root"
+}
+sync_policy >"$tmp/policy-sync-first.json"
+sync_policy >"$tmp/policy-sync-unchanged.json"
+python3 - "$tmp/policy-sync-store/spool.sqlite" "$tmp/policy-sync-first.json" "$tmp/policy-sync-unchanged.json" <<'PY'
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+row = db.execute("select revision, document from policy_state where issuer='smoke-issuer'").fetchone()
+assert row is not None and row[0] == 1
+assert db.execute("select count(*) from policy_audit").fetchone()[0] == 1
+assert json.load(open(sys.argv[2], encoding="utf-8"))["policy_status"] == "stored_last_good"
+assert json.load(open(sys.argv[3], encoding="utf-8"))["policy_status"] == "unchanged"
+PY
+
+python3 - "$tmp/policy.json" "$tmp/policy-invalid-root.json" "$tmp/outside-root" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+policy["policy_id"] = "smoke-policy-invalid-root"
+policy["revision"] = 2
+policy["settings"]["monitored_roots"] = [sys.argv[3]]
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(policy, separators=(",", ":")))
+PY
+openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$tmp/policy-invalid-root.json" -out "$tmp/policy-invalid-root.sig"
+python3 - "$certs" "$port" "$tmp/admin-token" "$tmp/policy-invalid-root.json" <<'PY'
+import socket, ssl, sys
+certs, port, token_file, policy_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+body = open(policy_file, "rb").read()
+token = open(token_file, encoding="utf-8").read().strip()
+ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+ctx.load_cert_chain(certs + "/operator.crt", certs + "/operator.key")
+headers = ("Host: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Bearer " + token +
+    "\r\nContent-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n").encode()
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="127.0.0.1") as sock:
+    sock.sendall(b"POST /v1/admin/policies HTTP/1.1\r\n" + headers + body)
+    response = b""
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk: break
+        response += chunk
+assert response.startswith(b"HTTP/1.1 201 "), response
+PY
+set +e
+sync_policy >"$tmp/policy-sync-rejected.json" 2>"$tmp/policy-sync-rejected.err"
+rc=$?
+set -e
+[ "$rc" -ne 0 ]
+grep -q 'policy root outside configured allowlist' "$tmp/policy-sync-rejected.err"
+python3 - "$tmp/policy-sync-store/spool.sqlite" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("select revision from policy_state where issuer='smoke-issuer'").fetchone()[0] == 1
+assert db.execute("select count(*) from policy_audit").fetchone()[0] == 1
+PY
+python3 - "$tmp/policy.json" "$tmp/policy-valid-revision-3.json" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+policy["policy_id"] = "smoke-policy-revision-3"
+policy["revision"] = 3
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(policy, separators=(",", ":")))
+PY
+openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$tmp/policy-valid-revision-3.json" -out "$tmp/policy-valid-revision-3.sig"
+python3 - "$certs" "$port" "$tmp/admin-token" "$tmp/policy-valid-revision-3.json" <<'PY'
+import socket, ssl, sys
+certs, port, token_file, policy_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+body = open(policy_file, "rb").read()
+token = open(token_file, encoding="utf-8").read().strip()
+ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+ctx.load_cert_chain(certs + "/operator.crt", certs + "/operator.key")
+headers = ("Host: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Bearer " + token +
+    "\r\nContent-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n").encode()
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname="127.0.0.1") as sock:
+    sock.sendall(b"POST /v1/admin/policies HTTP/1.1\r\n" + headers + body)
+    response = b""
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk: break
+        response += chunk
+assert response.startswith(b"HTTP/1.1 201 "), response
+PY
+sync_policy >"$tmp/policy-sync-recovered.json"
+python3 - "$tmp/policy-sync-store/spool.sqlite" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("select revision from policy_state where issuer='smoke-issuer'").fetchone()[0] == 3
+assert db.execute("select count(*) from policy_audit").fetchone()[0] == 2
+PY
+
 mkdir "$tmp/allowed-root/nested" "$tmp/outside-root"
 ln -s "$tmp/outside-root" "$tmp/allowed-root/external-link"
 expect_policy_rejected() {
@@ -278,7 +415,9 @@ PY
 
 "$bin_dir/sw-server" run --bind 127.0.0.1 --port "$port" \
     --cert "$certs/server.crt" --key "$certs/server.key" --ca "$certs/ca.crt" \
-    --agents "$certs/agents.txt" --db "$tmp/server.sqlite" >"$tmp/server-restart.log" 2>&1 &
+    --agents "$certs/agents.txt" --operators "$certs/operators.txt" \
+    --admin-token-file "$tmp/admin-token" --policy-key "$certs/policy-signing.key" \
+    --tenant smoke-tenant --db "$tmp/server.sqlite" >"$tmp/server-restart.log" 2>&1 &
 server_pid=$!
 python3 - "$certs" "$port" <<'PY'
 import socket, ssl, sys, time

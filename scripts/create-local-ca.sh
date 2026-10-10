@@ -40,8 +40,19 @@ openssl x509 -req -in "$out/agent.csr" -CA "$out/ca.crt" -CAkey "$out/ca.key" \
     -CAcreateserial -out "$out/agent.crt" -days 90 -sha256 -extfile "$out/agent.ext" >/dev/null 2>&1
 printf '%s\n' "$agent_id" >"$out/agents.txt"
 
+operator_id=linuxsecurity-lab-operator
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$out/operator.key" >/dev/null 2>&1
+openssl req -new -key "$out/operator.key" -subj "/CN=$operator_id" -out "$out/operator.csr" >/dev/null 2>&1
+cat >"$out/operator.ext" <<'EOF'
+extendedKeyUsage=clientAuth
+keyUsage=digitalSignature,keyEncipherment
+EOF
+openssl x509 -req -in "$out/operator.csr" -CA "$out/ca.crt" -CAkey "$out/ca.key" \
+    -CAcreateserial -out "$out/operator.crt" -days 90 -sha256 -extfile "$out/operator.ext" >/dev/null 2>&1
+printf '%s\n' "$operator_id" >"$out/operators.txt"
+
 openssl genpkey -algorithm ED25519 -out "$out/policy-signing.key" >/dev/null 2>&1
 openssl pkey -in "$out/policy-signing.key" -pubout -out "$out/policy-signing.pub" >/dev/null 2>&1
 chmod 600 "$out"/*.key "$out"/*.csr
-chmod 644 "$out"/*.crt "$out"/*.pub "$out"/agents.txt
-echo "Lab certificates and policy signing key created outside the repository at $out"
+chmod 644 "$out"/*.crt "$out"/*.pub "$out"/agents.txt "$out"/operators.txt
+echo "Lab certificates, operator identity, and policy signing key created outside the repository at $out"

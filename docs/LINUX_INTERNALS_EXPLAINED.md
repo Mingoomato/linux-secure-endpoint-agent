@@ -12,13 +12,13 @@ TCP는 메시지 경계가 없는 순서 있는 byte stream입니다. 한 번의
 
 OpenSSL의 `SSL*`는 `SSL_set_fd`로 socket에 연결되고 `SSL_accept`/`SSL_connect` handshake와 `SSL_read`/`SSL_write` record I/O를 처리합니다. TLS record와 HTTP body 경계는 서로 다른 계층입니다.
 
-Agent는 CA chain과 DNS/IP SAN을 확인하고 client certificate를 제시합니다. Server는 CA를 확인하고 peer certificate의 CN을 local allowlist와 대조합니다. CN allowlist는 실습용 연결이며 enrollment, revocation, 자동 rotation을 갖춘 PKI는 아닙니다.
+Agent는 CA chain과 DNS/IP SAN을 확인하고 client certificate를 제시합니다. Server는 CA를 확인하고 peer certificate의 CN을 역할별 local allowlist와 대조합니다. Policy publication은 별도 operator 인증서와 bearer token을 둘 다 요구합니다. Token은 server-user 소유의 mode-0600 파일에서 읽으며 constant-time 비교로 검사합니다. CN allowlist는 실습용 연결이며 enrollment, revocation, 자동 rotation을 갖춘 PKI는 아닙니다.
 
-TLS는 전송 중 데이터 보호와 인증을 제공합니다. 정책 발급자 권한은 별도 Ed25519 signature로 검증합니다. 정책 서명은 원본 파일 bytes에 묶이므로 공백 한 글자만 바뀌어도 검증에 실패합니다.
+TLS는 전송 중 데이터 보호와 인증을 제공합니다. 정책 발급자 권한은 별도 Ed25519 signature로 검증합니다. 정책 서명은 원본 파일 bytes에 묶이므로 공백 한 글자만 바뀌어도 검증에 실패합니다. 같은 호스트의 root/admin 프로세스나 키 파일 탈취를 token 비교 기법이 막아주지는 않습니다.
 
 ## HTTP framing과 모호한 메시지 거부
 
-Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subset을 처리합니다. Server는 한 Host, batch의 `application/json` Content-Type, POST Content-Length, decimal-only length를 요구하고 duplicate Content-Length/Content-Type과 모든 Transfer-Encoding을 거부합니다. Agent response parser도 Content-Length 하나만 허용하고 정확한 HTTP 200 status가 아닌 응답을 거부하며 길이 초과/잘림/추가 bytes를 검사합니다.
+Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subset을 처리합니다. Server는 한 Host, batch의 `application/json` Content-Type, POST Content-Length, decimal-only length를 요구하고 duplicate Content-Length/Content-Type/Authorization/If-None-Match와 모든 Transfer-Encoding을 거부합니다. Agent event response parser는 정확한 HTTP 200만 ACK로 받고, policy fetch parser는 HTTP 200/304만 허용합니다. 둘 다 Content-Length와 본문 경계를 검사합니다. Policy route는 문서 SHA-256을 ETag로 사용하고 일치하는 `If-None-Match`에 본문 없는 304를 응답합니다.
 
 이 정책은 여러 proxy/parser가 같은 byte stream을 다른 길이로 해석하는 상황을 줄이기 위한 것입니다. RFC의 모든 헤더 규칙·상태코드별 body semantics·chunked encoding을 지원하지 않습니다. 그러므로 custom parser를 인터넷 노출 서버에 재사용하면 안 됩니다. 현재 loopback 제한과 테스트는 lab scope의 경계입니다.
 
@@ -44,7 +44,7 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 정책의 monitored root를 사용자 입력 문자열의 접두사 비교만으로 제한하면 안 됩니다. `..` 구성 요소는 allowlist prefix가 문자열에 남아 있어도 다른 디렉터리를 가리킬 수 있고, 심볼릭 링크는 겉으로 보이는 위치와 실제 대상을 분리합니다. Agent는 설정된 허용 디렉터리와 각 요청 경로를 `std::filesystem::canonical`로 정규화해 기존 디렉터리 여부를 확인한 다음 경로 구성 요소를 비교합니다. `/safe/root2`는 `/safe/root`의 하위 경로가 아니므로 텍스트 prefix가 아니라 component 경계가 중요합니다.
 
-이 검사는 정책 문서를 저장하기 전의 경로 유효성 검사입니다. 현재 runtime watcher가 없어 파일을 실제로 열지는 않습니다. 미래에 감시를 시작하면서 같은 경로를 다시 사용할 경우 검사와 사용 사이에 symlink가 바뀌는 TOCTOU 경쟁이 남을 수 있으므로, 디렉터리 FD 기반 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해야 합니다.
+이 검사는 정책 문서를 last-good 상태로 저장하기 전의 경로 유효성 검사입니다. 현재 runtime watcher가 없어 파일을 실제로 열지는 않습니다. 미래에 감시를 시작하면서 같은 경로를 다시 사용할 경우 검사와 사용 사이에 symlink가 바뀌는 TOCTOU 경쟁이 남을 수 있으므로, 디렉터리 FD 기반 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해야 합니다.
 
 ## systemd와 프로세스 경계
 

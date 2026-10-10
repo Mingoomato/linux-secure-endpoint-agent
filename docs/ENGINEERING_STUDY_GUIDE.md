@@ -4,7 +4,7 @@
 
 이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부하고, 실패 후 last-good 문서가 유지되는지 확인합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구를 확인합니다. 추가로 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation/RBAC, policy runtime enforcement, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
@@ -18,7 +18,8 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest
 | HTTP framing 경계 | 바이트 스트림에서 하나의 요청·응답 경계를 모호하지 않게 정하고 자원 사용을 제한합니다. | Agent `http_exchange`, `server/include/agent/http.hpp`의 `parse_request_head`·`parse_request`, TLS adapter `read_request` |
 | 제한된 JSON 파서 | 숫자 문법, 중복 키, 깊이와 입력 크기를 검증합니다. | `agent/include/agent/json.hpp`, `server/include/agent/json.hpp` |
 | 멱등 ingestion | 같은 이벤트 재전송은 구분해 승인하고, 같은 ID의 다른 내용은 거부합니다. | `ingest`, SQLite 고유 키 |
-| 정책 서명 검증 | TLS와 별개로 정책 작성자의 서명 및 범위를 검증합니다. | `validate_signed_policy` |
+| operator 정책 제어면 | agent client 권한과 분리된 operator CN allowlist와 bearer token을 검사하고, tenant별 monotonic policy를 서명·게시합니다. | `serve_one`, `valid_admin_authorization`, `publish_policy` |
+| 정책 fetch와 last-good 저장 | 조건부 fetch 뒤 Ed25519 서명, scope, expiry, path와 revision을 확인하고 새 문서와 audit row를 함께 commit합니다. | `fetch_and_validate_policy`, `validate_policy_document`, `policy_audit` |
 | C transport probe | POSIX loopback socket 동작을 TLS와 분리해 연습합니다. | `transport-c/src/sw_probe.c` |
 
 ## 데이터·제어 흐름
@@ -29,7 +30,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest
 2. `open_queue`가 store 디렉터리 권한을 제한하고 SQLite WAL과 `synchronous=FULL`을 설정합니다. 큐, sequence, 정책 상태 테이블을 준비합니다.
 3. `next_sequence`가 트랜잭션으로 증가된 sequence를 저장합니다. `enqueue`는 고정된 합성 payload를 만들고 hash를 계산한 뒤, 행·바이트 quota를 확인해 네트워크 작업 전에 저장합니다.
 4. `pending`은 sequence 순서로 제한된 batch를 가져옵니다. `send_batch`는 CA, client 인증서, private-key 권한, CN, loopback 주소와 서버 DNS/IP SAN을 검증한 뒤 OpenSSL TLS 연결을 엽니다.
-5. HTTP 요청은 `application/json`과 정확한 `Content-Length`를 포함합니다. 응답 파서는 header 16 KiB·body 1 MiB 상한, 단일 `Content-Length`, `Transfer-Encoding` 거부, HTTP 200 status와 완전한 본문 길이를 확인합니다. 그 외 status는 ACK로 처리하지 않습니다. `ack_ids`는 accepted/duplicate ID를 읽고, `flush`는 실제 전송한 batch ID와 대조한 뒤 일치한 항목만 트랜잭션으로 삭제합니다.
+5. HTTP 요청은 `application/json`과 정확한 `Content-Length`를 포함합니다. event 응답 파서는 header 16 KiB·body 1 MiB 상한, 단일 `Content-Length`, `Transfer-Encoding` 거부, HTTP 200 status와 완전한 본문 길이를 확인합니다. 그 외 status는 ACK로 처리하지 않습니다. 별도 policy fetch는 200/304만 허용합니다. `ack_ids`는 accepted/duplicate ID를 읽고, `flush`는 실제 전송한 batch ID와 대조한 뒤 일치한 항목만 트랜잭션으로 삭제합니다.
 6. 네트워크·파싱 실패는 bounded exponential backoff와 jitter 뒤 재시도합니다. 서버가 commit하고 ACK가 유실되면 다음 전송은 중복으로 판별됩니다.
 
 ### Server 수신과 ingestion
@@ -37,12 +38,12 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest
 1. `run_server`는 loopback 이외의 bind를 거부하고, IPv4 loopback listener와 TLS 인증서를 준비합니다.
 2. `accept4(..., SOCK_CLOEXEC)`로 연결을 받고 `serve_one`이 mTLS handshake, CA chain, client 인증서 CN과 allowlist를 확인합니다. 이 구현은 연결을 한 번에 하나씩 처리합니다.
 3. `read_request`는 TLS에서 읽은 byte 조각을 `raw` 문자열에 모읍니다. transport-independent `parse_request_head`는 header 끝을 찾고 header·body 경계를 검사해, header가 아직 불완전하면 `nullopt`를 반환합니다. `parse_request`는 선언 길이와 실제 길이가 정확히 일치할 때만 소유형 `Request`를 반환합니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. 받은 socket의 read/write timeout은 5초입니다.
-4. `serve_one`이 health, status, telemetry, heartbeat, policy 경로를 분기합니다. `ingest`는 JSON schema, 주장된 agent ID, 인증서 identity, 이벤트 수, 민감 키, payload hash를 확인합니다.
+4. `serve_one`은 `/v1/admin/policies`에서 operator CN allowlist와 mode-0600 token을 모두 확인하고 새 JSON 정책을 제한된 schema로 검증한 뒤 Ed25519 서명과 monotonic tenant revision을 SQLite에 저장합니다. 같은 revision과 정확히 같은 문서의 재게시만 200 idempotent 응답이며, 새 정책은 201입니다. Agent policy GET은 서명 envelope를 200으로 주고 SHA-256 ETag가 일치하면 304로 본문 전송을 생략합니다. health, status, telemetry, heartbeat 경로도 역할별로 분기합니다. `ingest`는 JSON schema, 주장된 agent ID, 인증서 identity, 이벤트 수, 민감 키, payload hash를 확인합니다.
 5. 서버는 `(agent_id,event_id)` 고유 키로 transaction에 기록하고 commit한 뒤에만 ACK를 보냅니다. 동일 sequence/hash의 재수신은 duplicate, 내용이 바뀐 ID 재사용은 오류가 됩니다.
 
-### 서명 정책 경로
+### 서명 정책 게시·동기화 경로
 
-`validate_signed_policy`는 파일 크기를 제한해 정책과 서명을 읽고, JSON 파싱 전에 원본 바이트에 대한 64-byte Ed25519 detached signature를 검증합니다. UTC 만료 문자열을 고정 형식과 달력 날짜로 검증하고 허용 필드·action, tenant/root scope를 확인합니다. root 범위는 경로 문자열 접두사가 아니라 기존 디렉터리를 canonicalize한 뒤 구성 요소 단위로 비교하므로 `..` 정규화와 외부 symlink를 통한 이탈을 거부합니다. JSON parser가 숫자를 binary64로 보관하므로 revision은 양의 정수이며 안전한 정수 범위 안에 있을 때만 unsigned 정수로 변환합니다. 음수·소수·정밀도를 잃는 큰 숫자는 DB에 쓰기 전에 거부하며, 회귀 시험은 실패 후 기존 last-good revision과 원본 문서가 유지됨을 확인합니다. 저장된 정책을 적용하는 runtime watcher나 enforcement hook은 없습니다. 저장 성공을 정책 적용 성공으로 해석하면 안 되며, 향후 적용 시점의 파일시스템 변경 경쟁은 별도 해결해야 합니다.
+Operator는 operator 인증서와 bearer token을 함께 사용합니다. server는 policy schema와 tenant, timestamp, allowed actions, 설정 상한, revision을 확인한 다음 원본 문서 bytes를 Ed25519로 서명하고 SQLite transaction에서 정책 revision·signature를 갱신합니다. 동일 revision·동일 bytes는 idempotent이고, 같은/낮은 revision의 변경 문서는 rollback으로 거부됩니다. Agent의 `sync-policy`는 이전 last-good document의 SHA-256을 `If-None-Match`에 보내며 ETag가 같으면 server가 304를 반환합니다. 새 문서를 받은 경우 envelope를 파싱하고 64-byte signature를 복원한 뒤 JSON 파싱 전에 원본 문서 bytes를 검증합니다. 이어서 allowed field/action, issuer·tenant scope, issued/expiry UTC 시각, safe integer revision, 허용 root와 canonical path component containment를 검사합니다. 유효한 새 revision만 SQLite `policy_state`와 `policy_audit`에 한 transaction으로 저장해 DB가 부분 갱신되는 것을 막습니다. 회귀 시험은 외부 root로 향하는 서명 정책을 거부하고 이전 revision·audit 값을 유지한 뒤 다음 valid revision이 저장되는 것을 확인합니다. 저장된 `telemetry_enabled`, sample rate, monitored roots는 실제 collector의 설정으로 연결되지 않았으므로 이 경로는 검증·last-good 저장이지 runtime enforcement가 아닙니다. 향후 적용 시점의 filesystem 변경 경쟁도 별도 해결해야 합니다.
 
 ## Linux 인터페이스와 자원 수명
 
@@ -56,8 +57,8 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest
 ## 동시성, 보안 가정, 실패
 
 - Agent는 한 실행 흐름에서 queue를 처리합니다. Server accept loop도 순차 처리이므로 handshake 또는 느린 요청 하나가 뒤 연결을 지연시킬 수 있습니다. 5초 socket timeout과 byte cap은 일부 대기를 묶지만 worker pool이나 종단간 deadline을 대신하지 않습니다.
-- 가정은 로컬 OS와 DB 디렉터리, CA·정책 signing key, allowlist가 신뢰되고 개인키가 저장소 밖에서 보호된다는 것입니다. loopback은 외부 네트워크 노출을 줄일 뿐, 같은 호스트의 다른 프로세스를 인증하거나 격리하지 않습니다.
-- TLS chain 검증과 hostname/IP SAN 검증은 server identity를 확인합니다. Server는 client chain을 검증하고 CN allowlist로 로컬 권한을 확인합니다. 운영 enrollment, rotation, revocation, SAN URI 기반 identity는 구현되어 있지 않습니다.
+- 가정은 로컬 OS와 DB 디렉터리, CA·정책 signing key, agent/operator allowlist, bearer-token 파일이 신뢰되고 개인키가 저장소 밖에서 보호된다는 것입니다. loopback은 외부 네트워크 노출을 줄일 뿐, 같은 호스트의 다른 프로세스를 인증하거나 격리하지 않습니다.
+- TLS chain 검증과 hostname/IP SAN 검증은 server identity를 확인합니다. Server는 client chain을 검증하고 역할별 CN allowlist를 확인합니다. operator endpoint는 bearer token도 요구하지만 이는 lab 수준의 단순 RBAC입니다. 운영 enrollment, rotation, revocation, SAN URI 기반 identity는 구현되어 있지 않습니다.
 - 오류는 인증서·SAN 오류, TLS truncation, framing 위반, JSON 오류, DB transaction 실패, quota, hash 불일치, 잘못된 ACK, policy signature·scope·revision 실패로 나뉩니다. 새 event는 network 전에 저장되므로 일시 실패에 보존되지만 queue quota 또는 disk full은 저장할 수 없습니다.
 - 민감 키 이름 거부는 개인정보 보호의 보조 장치입니다. 완전한 정보 흐름 제어는 아니므로 schema, producer 제한, 권한, 로그 검토가 함께 필요합니다.
 
@@ -69,7 +70,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest
 - bounded worker pool은 처리량을 높일 수 있지만 FD, handshake, queue, DB writer를 함께 제한해야 합니다.
 - fingerprint 또는 SAN URI 기반 ID는 CN allowlist보다 명시적일 수 있지만 enrollment·rotation·revocation 수명주기가 필요합니다.
 - 관리형 JSON 라이브러리는 직접 parser 유지보수와 Unicode edge case를 줄입니다. 반대로 현재 코드의 parser를 읽으면 입력 상한과 허용 문법을 공부할 수 있습니다. agent/server parser 사본이 분리되어 있어 drift 위험이 남습니다.
-- 메시지 broker는 server-side buffering과 backpressure 선택지를 제공하지만 운영 자원과 credential이 늘어납니다. 실제 정책 적용은 validate/prepare/commit/rollback, audit, 실패 복구를 별도 설계해야 합니다.
+- 메시지 broker는 server-side buffering과 backpressure 선택지를 제공하지만 운영 자원과 credential이 늘어납니다. 현재 last-good 저장/audit transaction을 runtime 적용으로 확장하려면 validation과 staged config 준비, atomic swap, 실패 rollback, audit 의미를 먼저 정하고 concurrent reader의 관측 경계를 설계해야 합니다.
 
 ## 권장 학습 순서
 

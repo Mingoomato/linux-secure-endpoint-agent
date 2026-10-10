@@ -1,7 +1,9 @@
 #include "agent/json.hpp"
 #include "agent/http.hpp"
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <sqlite3.h>
 #include <arpa/inet.h>
@@ -20,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -30,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -76,7 +80,9 @@ sqlite3 *open_db(const std::string &path) {
         "CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL);"
         "CREATE TABLE IF NOT EXISTS events(agent_id TEXT NOT NULL,event_id TEXT NOT NULL,"
         " sequence INTEGER NOT NULL,payload_hash TEXT NOT NULL,received_at INTEGER NOT NULL,"
-        " PRIMARY KEY(agent_id,event_id));";
+        " PRIMARY KEY(agent_id,event_id));"
+        "CREATE TABLE IF NOT EXISTS policies(tenant_scope TEXT PRIMARY KEY,revision INTEGER NOT NULL,"
+        " policy_id TEXT NOT NULL,document BLOB NOT NULL,signature BLOB NOT NULL,published_at INTEGER NOT NULL);";
     char *error = nullptr;
     rc = sqlite3_exec(db, schema, nullptr, nullptr, &error);
     if (rc != SQLITE_OK) {
@@ -145,9 +151,11 @@ void write_all(SSL *ssl, const std::string &text) {
         off += static_cast<std::size_t>(n);
     }
 }
-void respond(SSL *ssl, int status, const std::string &reason, const std::string &body) {
+void respond(SSL *ssl, int status, const std::string &reason, const std::string &body,
+             const std::string &extra_headers = {}) {
     std::string response = "HTTP/1.1 " + std::to_string(status) + " " + reason +
-        "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
+        "\r\nContent-Type: application/json\r\nConnection: close\r\n" + extra_headers +
+        "Content-Length: " +
         std::to_string(body.size()) + "\r\n\r\n" + body;
     write_all(ssl, response);
 }
@@ -221,6 +229,268 @@ std::string sha256(const std::string &data) {
     out << std::hex << std::setfill('0');
     for (unsigned int i = 0; i < length; ++i) out << std::setw(2) << static_cast<unsigned>(digest[i]);
     return out.str();
+}
+
+std::string read_admin_token(const std::string &path) {
+    struct stat token_stat {};
+    if (stat(path.c_str(), &token_stat) != 0 || !S_ISREG(token_stat.st_mode) ||
+        token_stat.st_uid != geteuid() || (token_stat.st_mode & 0077) != 0)
+        throw std::runtime_error("admin token file must be owned by the server user with mode 0600");
+    std::ifstream input(path, std::ios::binary);
+    std::string token;
+    if (!std::getline(input, token) || token.size() < 32U || token.size() > 256U || input.peek() != EOF ||
+        !std::all_of(token.begin(), token.end(), [](unsigned char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '~' || c == '-';
+        }))
+        throw std::runtime_error("admin token file must contain one 32-256 character token");
+    return token;
+}
+
+EVP_PKEY *load_policy_signing_key(const std::string &path) {
+    struct stat key_stat {};
+    if (stat(path.c_str(), &key_stat) != 0 || !S_ISREG(key_stat.st_mode) ||
+        key_stat.st_uid != geteuid() || (key_stat.st_mode & 0077) != 0)
+        throw std::runtime_error("policy signing key must be owned by the server user with mode 0600");
+    FILE *file = fopen(path.c_str(), "r");
+    if (!file) throw std::runtime_error("cannot open policy signing key");
+    EVP_PKEY *key = PEM_read_PrivateKey(file, nullptr, nullptr, nullptr);
+    fclose(file);
+    if (!key || EVP_PKEY_id(key) != EVP_PKEY_ED25519) {
+        if (key) EVP_PKEY_free(key);
+        throw std::runtime_error("policy signing key must be Ed25519 PEM");
+    }
+    return key;
+}
+
+std::string sign_policy(EVP_PKEY *key, const std::string &document) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) throw std::runtime_error("policy signature context allocation failed");
+    std::size_t signature_size = 0;
+    bool ok = EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, key) == 1 &&
+        EVP_DigestSign(ctx, nullptr, &signature_size,
+            reinterpret_cast<const unsigned char *>(document.data()), document.size()) == 1 &&
+        signature_size == 64U;
+    std::string signature(signature_size, '\0');
+    if (ok) ok = EVP_DigestSign(ctx, reinterpret_cast<unsigned char *>(signature.data()), &signature_size,
+        reinterpret_cast<const unsigned char *>(document.data()), document.size()) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok || signature_size != 64U) throw std::runtime_error("policy signing failed");
+    signature.resize(signature_size);
+    return signature;
+}
+
+std::string hex_encode(const std::string &bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2U);
+    for (unsigned char byte : bytes) {
+        result.push_back(digits[byte >> 4U]);
+        result.push_back(digits[byte & 0x0fU]);
+    }
+    return result;
+}
+
+std::string sha256_hex(const std::string &data) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+    unsigned int size = 0;
+    if (EVP_Digest(data.data(), data.size(), digest.data(), &size, EVP_sha256(), nullptr) != 1 || size != 32U)
+        throw std::runtime_error("policy ETag digest failed");
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(64U);
+    for (unsigned int i = 0; i < size; ++i) {
+        result.push_back(digits[digest[i] >> 4U]);
+        result.push_back(digits[digest[i] & 0x0fU]);
+    }
+    return result;
+}
+
+std::time_t parse_policy_time(const std::string &value, const char *field) {
+    std::tm parsed_time {};
+    if (value.size() != 20U || value.back() != 'Z' ||
+        strptime(value.c_str(), "%Y-%m-%dT%H:%M:%SZ", &parsed_time) != value.c_str() + value.size())
+        throw std::runtime_error(std::string("policy ") + field + " format is invalid");
+    const std::tm requested_time = parsed_time;
+    const std::time_t epoch = timegm(&parsed_time);
+    std::tm normalized_time {};
+    if (epoch == static_cast<std::time_t>(-1) || gmtime_r(&epoch, &normalized_time) == nullptr ||
+        normalized_time.tm_year != requested_time.tm_year || normalized_time.tm_mon != requested_time.tm_mon ||
+        normalized_time.tm_mday != requested_time.tm_mday || normalized_time.tm_hour != requested_time.tm_hour ||
+        normalized_time.tm_min != requested_time.tm_min || normalized_time.tm_sec != requested_time.tm_sec)
+        throw std::runtime_error(std::string("policy ") + field + " calendar value is invalid");
+    return epoch;
+}
+
+std::pair<std::string, std::uint64_t> validate_publishable_policy(
+        const std::string &document, const std::string &expected_tenant) {
+    if (document.empty() || document.size() > 65536U)
+        throw std::runtime_error("policy document size is invalid");
+    const Value policy = agent::json::Parser(document).parse();
+    if (required(policy, "schema_version").string_or() != "policy.v1")
+        throw std::runtime_error("unsupported policy schema");
+    const auto *object = std::get_if<agent::json::Object>(&policy.data);
+    if (!object) throw std::runtime_error("policy must be an object");
+    const std::set<std::string> top_allowed = {"schema_version", "policy_id", "revision", "issuer", "issued_at",
+        "expires_at", "tenant_scope", "allowed_actions", "settings"};
+    for (const auto &[name, value] : *object) {
+        (void)value;
+        if (!top_allowed.contains(name)) throw std::runtime_error("policy field rejected");
+    }
+    const std::string policy_id = required(policy, "policy_id").string_or();
+    const std::string issuer = required(policy, "issuer").string_or();
+    const std::string tenant = required(policy, "tenant_scope").string_or();
+    if (policy_id.empty() || policy_id.size() > 128U || issuer.empty() || issuer.size() > 128U ||
+        tenant.empty() || tenant != expected_tenant)
+        throw std::runtime_error("policy identity or tenant scope is invalid");
+    const double revision_number = required(policy, "revision").number_or(-1.0);
+    constexpr double max_safe_integer = 9007199254740991.0;
+    if (revision_number < 1.0 || revision_number > max_safe_integer || std::floor(revision_number) != revision_number)
+        throw std::runtime_error("SEA_POLICY_REVISION_INVALID");
+    const auto revision = static_cast<std::uint64_t>(revision_number);
+
+    const std::time_t issued_epoch = parse_policy_time(required(policy, "issued_at").string_or(), "issued_at");
+    const std::time_t expiry_epoch = parse_policy_time(required(policy, "expires_at").string_or(), "expires_at");
+    if (issued_epoch > std::time(nullptr) + 300)
+        throw std::runtime_error("policy issued_at is in the future");
+    if (expiry_epoch <= std::time(nullptr) || expiry_epoch <= issued_epoch)
+        throw std::runtime_error("SEA_POLICY_EXPIRED: invalid or expired policy");
+
+    const auto *actions = std::get_if<Array>(&required(policy, "allowed_actions").data);
+    if (!actions || actions->empty() || actions->size() > 8U)
+        throw std::runtime_error("policy actions must be a bounded non-empty array");
+    for (const auto &action : *actions) {
+        const std::string name = action.string_or();
+        if (name != "telemetry.configure" && name != "monitor.roots.configure")
+            throw std::runtime_error("policy action rejected");
+    }
+    const auto *settings = std::get_if<agent::json::Object>(&required(policy, "settings").data);
+    if (!settings) throw std::runtime_error("policy settings must be an object");
+    for (const auto &[name, value] : *settings) {
+        if (name == "telemetry_enabled") {
+            if (!std::get_if<bool>(&value.data)) throw std::runtime_error("telemetry_enabled must be boolean");
+        } else if (name == "sample_rate") {
+            const double rate = value.number_or(-1.0);
+            if (rate < 0.0 || rate > 1.0) throw std::runtime_error("sample_rate is out of range");
+        } else if (name == "monitored_roots") {
+            const auto *roots = std::get_if<Array>(&value.data);
+            if (!roots || roots->size() > 32U) throw std::runtime_error("monitored_roots must be a bounded array");
+            for (const auto &root : *roots) {
+                const std::string path = root.string_or();
+                if (path.empty() || path.front() != '/' || path.find("/../") != std::string::npos ||
+                    path.ends_with("/.."))
+                    throw std::runtime_error("monitored root path is invalid");
+            }
+        } else throw std::runtime_error("policy setting rejected");
+    }
+    return {policy_id, revision};
+}
+
+struct PublishedPolicy {
+    std::string policy_id;
+    std::string document;
+    std::string signature;
+    std::uint64_t revision = 0;
+    bool unchanged = false;
+};
+
+PublishedPolicy publish_policy(sqlite3 *db, EVP_PKEY *signing_key, const std::string &tenant,
+                               const std::string &document) {
+    auto [policy_id, revision] = validate_publishable_policy(document, tenant);
+    std::string signature = sign_policy(signing_key, document);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw std::runtime_error("policy publish transaction unavailable");
+    try {
+        sqlite3_stmt *current = nullptr;
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT revision,document,signature,policy_id FROM policies WHERE tenant_scope=?1",
+            -1, &current, nullptr), db, "prepare current policy read");
+        sqlite3_bind_text(current, 1, tenant.c_str(), -1, SQLITE_TRANSIENT);
+        const int current_rc = sqlite3_step(current);
+        std::uint64_t old_revision = 0;
+        std::string old_document;
+        std::string old_signature;
+        std::string old_policy_id;
+        if (current_rc == SQLITE_ROW) {
+            old_revision = static_cast<std::uint64_t>(sqlite3_column_int64(current, 0));
+            const auto *doc_data = static_cast<const char *>(sqlite3_column_blob(current, 1));
+            const int doc_size = sqlite3_column_bytes(current, 1);
+            if (doc_data && doc_size > 0) old_document.assign(doc_data, static_cast<std::size_t>(doc_size));
+            const auto *sig_data = static_cast<const char *>(sqlite3_column_blob(current, 2));
+            const int sig_size = sqlite3_column_bytes(current, 2);
+            if (sig_data && sig_size > 0) old_signature.assign(sig_data, static_cast<std::size_t>(sig_size));
+            const auto *id_data = reinterpret_cast<const char *>(sqlite3_column_text(current, 3));
+            if (id_data) old_policy_id = id_data;
+        } else if (current_rc != SQLITE_DONE) {
+            sqlite3_finalize(current);
+            throw std::runtime_error("current policy read failed");
+        }
+        sqlite3_finalize(current);
+        if (current_rc == SQLITE_ROW && revision <= old_revision) {
+            if (revision == old_revision && document == old_document) {
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                return {old_policy_id, old_document, old_signature, old_revision, true};
+            }
+            throw std::runtime_error("SEA_POLICY_ROLLBACK");
+        }
+        sqlite3_stmt *write = nullptr;
+        sql_check(sqlite3_prepare_v2(db,
+            "INSERT INTO policies(tenant_scope,revision,policy_id,document,signature,published_at)"
+            " VALUES(?1,?2,?3,?4,?5,strftime('%s','now'))"
+            " ON CONFLICT(tenant_scope) DO UPDATE SET revision=excluded.revision,policy_id=excluded.policy_id,"
+            " document=excluded.document,signature=excluded.signature,published_at=excluded.published_at",
+            -1, &write, nullptr), db, "prepare policy publish");
+        sqlite3_bind_text(write, 1, tenant.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(write, 2, static_cast<sqlite3_int64>(revision));
+        sqlite3_bind_text(write, 3, policy_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_blob(write, 4, document.data(), static_cast<int>(document.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_blob(write, 5, signature.data(), static_cast<int>(signature.size()), SQLITE_TRANSIENT);
+        sql_check(sqlite3_step(write), db, "publish policy");
+        sqlite3_finalize(write);
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("policy publish commit failed");
+        return {policy_id, document, signature, revision, false};
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
+    }
+}
+
+std::optional<PublishedPolicy> current_policy(sqlite3 *db, const std::string &tenant) {
+    sqlite3_stmt *statement = nullptr;
+    sql_check(sqlite3_prepare_v2(db,
+        "SELECT revision,policy_id,document,signature FROM policies WHERE tenant_scope=?1",
+        -1, &statement, nullptr), db, "prepare policy fetch");
+    sqlite3_bind_text(statement, 1, tenant.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(statement);
+        return std::nullopt;
+    }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(statement);
+        throw std::runtime_error("policy fetch failed");
+    }
+    PublishedPolicy result;
+    result.revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 0));
+    const auto *id = reinterpret_cast<const char *>(sqlite3_column_text(statement, 1));
+    if (id) result.policy_id = id;
+    const auto *document = static_cast<const char *>(sqlite3_column_blob(statement, 2));
+    const int document_size = sqlite3_column_bytes(statement, 2);
+    if (document && document_size > 0) result.document.assign(document, static_cast<std::size_t>(document_size));
+    const auto *signature = static_cast<const char *>(sqlite3_column_blob(statement, 3));
+    const int signature_size = sqlite3_column_bytes(statement, 3);
+    if (signature && signature_size > 0) result.signature.assign(signature, static_cast<std::size_t>(signature_size));
+    sqlite3_finalize(statement);
+    if (result.document.empty() || result.signature.size() != 64U)
+        throw std::runtime_error("stored policy is incomplete");
+    return result;
+}
+
+bool valid_admin_authorization(const std::string &header, const std::string &token) {
+    const std::string expected = "Bearer " + token;
+    return header.size() == expected.size() &&
+        CRYPTO_memcmp(header.data(), expected.data(), expected.size()) == 0;
 }
 
 void ingest(sqlite3 *db, const std::set<std::string> &agents, SSL *ssl,
@@ -298,7 +568,9 @@ void ingest(sqlite3 *db, const std::set<std::string> &agents, SSL *ssl,
     respond(ssl, 200, "OK", body.str());
 }
 
-void serve_one(sqlite3 *db, const std::set<std::string> &agents, SSL_CTX *ctx, int fd) {
+void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<std::string> &operators,
+               const std::string &admin_token, const std::string &tenant, EVP_PKEY *policy_key,
+               SSL_CTX *ctx, int fd) {
     ScopedFd socket_fd(fd);
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx), SSL_free);
     if (!ssl) return;
@@ -310,14 +582,29 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, SSL_CTX *ctx, i
         return;
     }
     std::string identity = peer_cn(ssl.get());
-    if (identity.empty() || !agents.contains(identity)) {
+    if (identity.empty() || (!agents.contains(identity) && !operators.contains(identity))) {
         respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_AGENT_UNAUTHORIZED\"}");
         SSL_shutdown(ssl.get()); return;
     }
     try {
         Request req = read_request(ssl.get());
-        if (req.path == "/healthz" && req.method == "GET") {
+        if (req.path == "/v1/admin/policies" && req.method == "POST") {
+            if (!operators.contains(identity) || !valid_admin_authorization(req.authorization, admin_token)) {
+                respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_OPERATOR_UNAUTHORIZED\"}");
+            } else if (agent::http::lowercase_ascii(req.content_type) != "application/json") {
+                respond(ssl.get(), 400, "Bad Request", "{\"error\":\"policy_requires_json\"}");
+            } else {
+                PublishedPolicy published = publish_policy(db, policy_key, tenant, req.body);
+                std::string body = "{\"schema_version\":\"policy_publish_ack.v1\",\"revision\":" +
+                    std::to_string(published.revision) + ",\"status\":" +
+                    json_quote(published.unchanged ? "unchanged" : "published") + "}";
+                respond(ssl.get(), published.unchanged ? 200 : 201,
+                    published.unchanged ? "OK" : "Created", body);
+            }
+        } else if (req.path == "/healthz" && req.method == "GET") {
             respond(ssl.get(), 200, "OK", "{\"status\":\"ok\"}");
+        } else if (!agents.contains(identity)) {
+            respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_AGENT_UNAUTHORIZED\"}");
         } else if (req.path == "/v1/agents/self/events:batch" && req.method == "POST") {
             if (agent::http::lowercase_ascii(req.content_type) != "application/json")
                 throw std::runtime_error("event batch requires application/json Content-Type");
@@ -327,9 +614,24 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, SSL_CTX *ctx, i
         } else if (req.path == "/v1/agents/self/status" && req.method == "GET") {
             respond(ssl.get(), 200, "OK", "{\"schema_version\":\"agent_status.v1\",\"state\":\"registered\"}");
         } else if (req.path == "/v1/agents/self/policy" && req.method == "GET") {
-            respond(ssl.get(), 304, "Not Modified", "{}");
-        } else if (req.path == "/v1/admin/policies" && req.method == "POST") {
-            respond(ssl.get(), 403, "Forbidden", "{\"error\":\"operator API is disabled in this lab build\"}");
+            const auto policy = current_policy(db, tenant);
+            if (!policy) {
+                respond(ssl.get(), 404, "Not Found", "{\"error\":\"SEA_POLICY_NOT_FOUND\"}");
+            } else {
+                const std::string etag = "\"" + sha256_hex(policy->document) + "\"";
+                if (req.if_none_match == etag) {
+                    respond(ssl.get(), 304, "Not Modified", "",
+                        "ETag: " + etag + "\r\nCache-Control: no-store\r\n");
+                    SSL_shutdown(ssl.get());
+                    return;
+                }
+                const std::string body = "{\"schema_version\":\"policy_envelope.v1\",\"policy_id\":" +
+                    json_quote(policy->policy_id) + ",\"revision\":" + std::to_string(policy->revision) +
+                    ",\"policy_document\":" + json_quote(policy->document) +
+                    ",\"signature_hex\":" + json_quote(hex_encode(policy->signature)) + "}";
+                respond(ssl.get(), 200, "OK", body,
+                    "ETag: " + etag + "\r\nCache-Control: no-store\r\n");
+            }
         } else {
             respond(ssl.get(), 404, "Not Found", "{\"error\":\"not_found\"}");
         }
@@ -346,10 +648,19 @@ int run_server(int argc, char **argv) {
         throw std::runtime_error("SEA_SCOPE_INVALID: server is loopback-only");
     std::string cert = arg(argc, argv, "--cert"), key = arg(argc, argv, "--key");
     std::string ca = arg(argc, argv, "--ca"), agents_file = arg(argc, argv, "--agents");
+    std::string operators_file = arg(argc, argv, "--operators");
+    std::string admin_token_file = arg(argc, argv, "--admin-token-file");
+    std::string policy_key_file = arg(argc, argv, "--policy-key");
+    std::string tenant = arg(argc, argv, "--tenant");
     std::string dbfile = arg(argc, argv, "--db", "./server.sqlite");
     int port = std::stoi(arg(argc, argv, "--port", "8443"));
     if (port < 1024 || port > 65535) throw std::runtime_error("invalid listen port");
     std::set<std::string> agents = read_allowlist(agents_file);
+    std::set<std::string> operators = read_allowlist(operators_file);
+    if (tenant.empty() || tenant.size() > 128U) throw std::runtime_error("--tenant must be configured");
+    const std::string admin_token = read_admin_token(admin_token_file);
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> policy_key(
+        load_policy_signing_key(policy_key_file), EVP_PKEY_free);
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) throw std::runtime_error("TLS context allocation failed");
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
@@ -391,7 +702,7 @@ int run_server(int argc, char **argv) {
             continue;
         }
         if (fd < 0) break;
-        serve_one(db, agents, ctx, fd);
+        serve_one(db, agents, operators, admin_token, tenant, policy_key.get(), ctx, fd);
     }
     close(listener); sqlite3_close(db); SSL_CTX_free(ctx);
     return 0;
@@ -401,7 +712,8 @@ int run_server(int argc, char **argv) {
 int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
-            std::cout << "sw-server run --cert FILE --key FILE --ca FILE --agents FILE [--db FILE --port N]\n";
+            std::cout << "sw-server run --cert FILE --key FILE --ca FILE --agents FILE --operators FILE "
+                         "--admin-token-file FILE --policy-key FILE --tenant ID [--db FILE --port N]\n";
             return argc < 2 ? 2 : 0;
         }
         if (std::string(argv[1]) != "run") throw std::runtime_error("unknown command");

@@ -1,6 +1,6 @@
 # Requirements traceability (SRS-06)
 
-The recorded loopback integration and parser tests verify selected mTLS, queue, deduplication, policy-signature, policy path/date rejection, strict JSON, and bounded HTTP request parsing paths. A seeded 100,000-run libFuzzer campaign is limited parser evidence, not full protocol or SRS verification. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
+The recorded loopback integration verifies selected mTLS, separated operator authorization, policy publication/signing/fetch, ETag/304, agent sync, last-good recovery, queue, and deduplication paths. Parser tests and a seeded 100,000-run libFuzzer campaign provide limited parser evidence, not full protocol or SRS verification. Runtime policy enforcement, enrollment/revocation, performance, resource-fault, and deployment matrices remain open. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
 
 | Requirement | Source / artifact | Verification | Status |
 |---|---|---|---|
@@ -16,10 +16,10 @@ The recorded loopback integration and parser tests verify selected mTLS, queue, 
 | SEA-FR-010 | accepted/duplicate acknowledgement | SEA-T-005 pending | IMPLEMENTED |
 | SEA-FR-011 | quotas and bounded retry | SEA-T-006/008 pending | IN_PROGRESS |
 | SEA-FR-012 | allowlisted fields/actions and canonical monitored-root containment | tests/smoke.sh (traversal and external symlink rejection); malicious command-key test pending | IN_PROGRESS |
-| SEA-FR-013 | Ed25519 detached signature + tenant scope + strict UTC expiry | tests/smoke.sh (signature tamper, invalid calendar date, replay); expired-policy matrix pending | IN_PROGRESS |
-| SEA-FR-014 | positive integral safe revision, monotonic version, and last-good DB | tests/smoke.sh (negative/fractional/unsafe revision rejection, old document retained, replay rejected); expired/wrong-scope update matrix pending | IN_PROGRESS |
-| SEA-FR-015 | validate then transactional last-good swap | SEA-T-011 pending | IN_PROGRESS |
-| SEA-FR-016 | registry, telemetry, heartbeat, status, health routes; bounded HTTP/1.1 framing and JSON media type | `tests/smoke.sh`, `tests/http_parser_test.cpp`, and 100,000-run `tests/http_parser_fuzz.cpp`; route/framing matrix remains partial | IN_PROGRESS |
+| SEA-FR-013 | Ed25519 detached signature + tenant scope + strict issued/expiry UTC timestamps; server signs exact policy bytes | tests/smoke.sh (operator publish/fetch, signature tamper, invalid calendar date); full expiry/wrong-scope matrix pending | IN_PROGRESS |
+| SEA-FR-014 | positive integral safe revision, monotonic publish, and agent last-good DB | tests/smoke.sh (negative/fractional/unsafe revision rejection, invalid higher revision leaves prior state, next valid revision recovers); wrong-scope/expiry update matrix pending | IN_PROGRESS |
+| SEA-FR-015 | validate policy then transactionally replace last-good document and write audit row | tests/smoke.sh checks failed update preserves revision/audit and next accepted update is audited; runtime collector apply/rollback hook remains open | IN_PROGRESS |
+| SEA-FR-016 | agent registry, telemetry, heartbeat, status, health; operator-only policy publish and agent policy fetch | `tests/smoke.sh` verifies separate operator CN+bearer auth, 201/identical 200, 200/ETag 304, agent sync, plus `tests/http_parser_test.cpp`; registry lifecycle and full route/status matrix remain partial | IN_PROGRESS |
 | SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection and strict JSON parsing | parser CTests; SEA-T-012 privacy tests pending | IN_PROGRESS |
 | SEA-FR-018 | systemd units, PID stop, service controls | SEA-T-014 pending | IN_PROGRESS |
 | SEA-FR-019 | logs omit key/token/payload values | source review pending | IN_PROGRESS |

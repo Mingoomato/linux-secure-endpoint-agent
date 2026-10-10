@@ -33,10 +33,14 @@ int main() {
 
         const std::string body = "{}";
         const std::string post = "POST /v1/agents/self/events:batch HTTP/1.1\r\nHost: localhost\r\n"
-            "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+            "Content-Type: application/json\r\nAuthorization: Bearer lab-secret\r\n"
+            "If-None-Match: \"abc123\"\r\n"
+            "Content-Length: 2\r\n\r\n{}";
         const auto parsed_post = agent::http::parse_request(post);
         require(parsed_post.method == "POST" && parsed_post.path == "/v1/agents/self/events:batch" &&
-                parsed_post.content_type == "application/json" && parsed_post.body == body,
+                parsed_post.content_type == "application/json" &&
+                parsed_post.authorization == "Bearer lab-secret" &&
+                parsed_post.if_none_match == "\"abc123\"" && parsed_post.body == body,
                 "POST request fields were not preserved");
 
         require(!agent::http::parse_request_head("GET /healthz HTTP/1.1\r\nHost: localhost\r\n"),
@@ -68,6 +72,11 @@ int main() {
         require(rejected(post + "x"), "bytes after the framed request were accepted");
         require(rejected("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Type: a\r\nContent-Type: b\r\n"
                          "Content-Length: 0\r\n\r\n"), "duplicate Content-Type was accepted");
+        require(rejected("POST /x HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer one\r\n"
+                         "Authorization: Bearer two\r\nContent-Length: 0\r\n\r\n"),
+                "duplicate Authorization was accepted");
+        require(rejected("GET /x HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: one\r\n"
+                         "If-None-Match: two\r\n\r\n"), "duplicate If-None-Match was accepted");
         require(rejected("POST /x HTTP/1.1\r\nHost: localhost\r\nX-Control: bad\x01value\r\n"
                          "Content-Length: 0\r\n\r\n"), "control byte in header value was accepted");
         require(rejected("GET /healthz HTTP/1.1\r\nHost: localhost\r\n" + std::string(17000U, 'a') + "\r\n\r\n"),

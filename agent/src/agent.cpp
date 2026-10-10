@@ -134,7 +134,9 @@ sqlite3 *open_queue(const std::string &store) {
         "CREATE TABLE IF NOT EXISTS queue(event_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL,"
         " observed_at TEXT NOT NULL,payload TEXT NOT NULL,payload_hash TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
-        "CREATE TABLE IF NOT EXISTS policy_state(issuer TEXT PRIMARY KEY,revision INTEGER NOT NULL,document BLOB NOT NULL);";
+        "CREATE TABLE IF NOT EXISTS policy_state(issuer TEXT PRIMARY KEY,revision INTEGER NOT NULL,document BLOB NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS policy_audit(issuer TEXT NOT NULL,revision INTEGER NOT NULL,"
+        " action TEXT NOT NULL,committed_at INTEGER NOT NULL,PRIMARY KEY(issuer,revision));";
     char *error = nullptr;
     rc = sqlite3_exec(db, schema, nullptr, nullptr, &error);
     if (rc != SQLITE_OK) {
@@ -319,7 +321,32 @@ struct ScopedFd {
     ScopedFd &operator=(const ScopedFd &) = delete;
     int get() const { return value; }
 };
-std::string http_exchange(SSL *ssl, const std::string &request) {
+struct TlsClientConnection {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> context;
+    ScopedFd socket_fd;
+    std::unique_ptr<SSL, decltype(&SSL_free)> session;
+    explicit TlsClientConnection(const Config &config)
+        : context(client_context(config), SSL_CTX_free),
+          socket_fd(connect_socket(config.host, config.port)),
+          session(nullptr, SSL_free) {
+        session.reset(SSL_new(context.get()));
+        if (!session) throw std::runtime_error("TLS session allocation failed");
+        if (SSL_set_fd(session.get(), socket_fd.get()) != 1)
+            throw std::runtime_error("TLS socket setup failed");
+        in_addr ip4 {};
+        in6_addr ip6 {};
+        const int verify_name = (inet_pton(AF_INET, config.host.c_str(), &ip4) == 1)
+            ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session.get()), config.host.c_str())
+            : ((inet_pton(AF_INET6, config.host.c_str(), &ip6) == 1)
+                ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session.get()), config.host.c_str())
+                : SSL_set1_host(session.get(), config.host.c_str()));
+        if (verify_name != 1) throw std::runtime_error("TLS hostname verifier setup failed");
+        if (SSL_connect(session.get()) != 1 || SSL_get_verify_result(session.get()) != X509_V_OK)
+            throw std::runtime_error("SEA_TLS_UNTRUSTED_SERVER: TLS handshake/hostname verification failed");
+    }
+};
+std::string http_exchange(SSL *ssl, const std::string &request,
+                          const std::vector<std::string> &allowed_statuses = {"200"}) {
     std::size_t sent = 0;
     while (sent < request.size()) {
         int n = SSL_write(ssl, request.data() + sent, static_cast<int>(request.size() - sent));
@@ -353,8 +380,12 @@ std::string http_exchange(SSL *ssl, const std::string &request) {
                         [](unsigned char c) { return c >= '0' && c <= '9'; }))
                     throw std::runtime_error("SEA_ACK_MALFORMED: invalid HTTP status line");
                 std::string status_code = status_line.substr(first_space + 1U, 3U);
-                if (status_code != "200")
-                    throw std::runtime_error("SEA_HTTP_STATUS: expected 200, received " + status_code);
+                if (std::find(allowed_statuses.begin(), allowed_statuses.end(), status_code) == allowed_statuses.end()) {
+                    if (allowed_statuses.size() == 1U)
+                        throw std::runtime_error("SEA_HTTP_STATUS: expected " + allowed_statuses.front() +
+                            ", received " + status_code);
+                    throw std::runtime_error("SEA_HTTP_STATUS: unexpected " + status_code);
+                }
                 bool found_length = false;
                 std::size_t pos = first_end + 2U;
                 while (pos < headers.size()) {
@@ -421,23 +452,7 @@ std::vector<std::string> ack_ids(const std::string &response, const std::string 
 }
 std::vector<std::string> send_batch(const Config &c, const std::vector<Queued> &events) {
     if (events.empty()) return {};
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(client_context(c), SSL_CTX_free);
-    ScopedFd socket_fd(connect_socket(c.host, c.port));
-    int fd = socket_fd.get();
-    std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), SSL_free);
-    if (!ssl) throw std::runtime_error("TLS session allocation failed");
-    if (SSL_set_fd(ssl.get(), fd) != 1) throw std::runtime_error("TLS socket setup failed");
-    in_addr ip4 {};
-    in6_addr ip6 {};
-    int verify_name = (inet_pton(AF_INET, c.host.c_str(), &ip4) == 1)
-        ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl.get()), c.host.c_str())
-        : ((inet_pton(AF_INET6, c.host.c_str(), &ip6) == 1)
-            ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl.get()), c.host.c_str())
-            : SSL_set1_host(ssl.get(), c.host.c_str()));
-    if (verify_name != 1) throw std::runtime_error("TLS hostname verifier setup failed");
-    if (SSL_connect(ssl.get()) != 1 || SSL_get_verify_result(ssl.get()) != X509_V_OK) {
-        throw std::runtime_error("SEA_TLS_UNTRUSTED_SERVER: TLS handshake/hostname verification failed");
-    }
+    TlsClientConnection connection(c);
     std::string batch = "{\"schema_version\":\"agent_batch.v1\",\"batch_id\":\"" + uuid() +
         "\",\"agent_id\":\"" + escape(c.agent_id) + "\",\"events\":[";
     for (std::size_t i = 0; i < events.size(); ++i) {
@@ -448,8 +463,8 @@ std::vector<std::string> send_batch(const Config &c, const std::vector<Queued> &
     std::string req = "POST /v1/agents/self/events:batch HTTP/1.1\r\nHost: " + c.host +
         "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
         std::to_string(batch.size()) + "\r\n\r\n" + batch;
-    std::string response = http_exchange(ssl.get(), req);
-    (void)SSL_shutdown(ssl.get());
+    std::string response = http_exchange(connection.session.get(), req);
+    (void)SSL_shutdown(connection.session.get());
     auto accepted = ack_ids(response, "accepted_ids");
     auto duplicates = ack_ids(response, "duplicate_ids");
     accepted.insert(accepted.end(), duplicates.begin(), duplicates.end());
@@ -492,11 +507,26 @@ std::string read_limited(const std::string &path, std::size_t cap) {
     if (data.size() > cap) throw std::runtime_error("input size limit exceeded");
     return data;
 }
-void validate_signed_policy(const Config &c, const std::string &file, const std::string &sigfile,
-                            const std::string &pubfile, const std::string &tenant,
-                            const std::string &allowed_root) {
-    std::string document = read_limited(file, 65536);
-    std::string signature = read_limited(sigfile, 128);
+std::time_t parse_policy_time(const std::string &value, const char *field) {
+    std::tm parsed {};
+    if (value.size() != 20U || value.back() != 'Z' ||
+        strptime(value.c_str(), "%Y-%m-%dT%H:%M:%SZ", &parsed) != value.c_str() + value.size())
+        throw std::runtime_error(std::string("policy ") + field + " invalid");
+    const std::tm requested = parsed;
+    const std::time_t epoch = timegm(&parsed);
+    std::tm normalized {};
+    if (epoch == static_cast<std::time_t>(-1) || gmtime_r(&epoch, &normalized) == nullptr ||
+        normalized.tm_year != requested.tm_year || normalized.tm_mon != requested.tm_mon ||
+        normalized.tm_mday != requested.tm_mday || normalized.tm_hour != requested.tm_hour ||
+        normalized.tm_min != requested.tm_min || normalized.tm_sec != requested.tm_sec)
+        throw std::runtime_error(std::string("policy ") + field + " invalid");
+    return epoch;
+}
+bool validate_policy_document(const Config &c, const std::string &document, const std::string &signature,
+                              const std::string &pubfile, const std::string &tenant,
+                              const std::string &allowed_root, bool allow_unchanged) {
+    if (document.empty() || document.size() > 65536U)
+        throw std::runtime_error("policy document size is invalid");
     if (signature.size() != 64) throw std::runtime_error("policy signature must be raw 64-byte Ed25519");
     FILE *keyf = fopen(pubfile.c_str(), "r");
     if (!keyf) throw std::runtime_error("cannot open policy public key");
@@ -525,6 +555,7 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
         if (std::find(top_allowed.begin(), top_allowed.end(), name) == top_allowed.end())
             throw std::runtime_error("policy field rejected: " + name);
     }
+    std::string policy_id = root.get("policy_id") ? root.get("policy_id")->string_or() : "";
     std::string issuer = root.get("issuer") ? root.get("issuer")->string_or() : "";
     std::string policy_tenant = root.get("tenant_scope") ? root.get("tenant_scope")->string_or() : "";
     const Value *revision_value = root.get("revision");
@@ -534,26 +565,20 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
         std::floor(parsed_revision) != parsed_revision)
         throw std::runtime_error("SEA_POLICY_REVISION_INVALID");
     const auto revision = static_cast<std::uint64_t>(parsed_revision);
-    if (issuer.empty() || policy_tenant != tenant)
+    if (policy_id.empty() || policy_id.size() > 128U || issuer.empty() || issuer.size() > 128U ||
+        policy_tenant.empty() || policy_tenant != tenant)
         throw std::runtime_error("SEA_SCOPE_INVALID: issuer or tenant scope invalid");
-    std::string expires = root.get("expires_at") ? root.get("expires_at")->string_or() : "";
-    std::tm tm {};
-    if (expires.size() != 20U || expires.back() != 'Z' ||
-        strptime(expires.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tm) != expires.c_str() + expires.size())
-        throw std::runtime_error("policy expires_at invalid");
-    const std::tm requested_time = tm;
-    const std::time_t expiry_epoch = timegm(&tm);
-    std::tm normalized_time {};
-    if (expiry_epoch == static_cast<std::time_t>(-1) ||
-        gmtime_r(&expiry_epoch, &normalized_time) == nullptr ||
-        normalized_time.tm_year != requested_time.tm_year || normalized_time.tm_mon != requested_time.tm_mon ||
-        normalized_time.tm_mday != requested_time.tm_mday || normalized_time.tm_hour != requested_time.tm_hour ||
-        normalized_time.tm_min != requested_time.tm_min || normalized_time.tm_sec != requested_time.tm_sec)
-        throw std::runtime_error("policy expires_at invalid");
-    if (expiry_epoch <= std::time(nullptr)) throw std::runtime_error("SEA_POLICY_EXPIRED");
+    const std::time_t issued_epoch = parse_policy_time(
+        root.get("issued_at") ? root.get("issued_at")->string_or() : "", "issued_at");
+    const std::time_t expiry_epoch = parse_policy_time(
+        root.get("expires_at") ? root.get("expires_at")->string_or() : "", "expires_at");
+    if (issued_epoch > std::time(nullptr) + 300) throw std::runtime_error("policy issued_at is in the future");
+    if (expiry_epoch <= std::time(nullptr) || expiry_epoch <= issued_epoch)
+        throw std::runtime_error("SEA_POLICY_EXPIRED");
     const Value *actions_v = root.get("allowed_actions");
     const auto *actions = actions_v ? std::get_if<Array>(&actions_v->data) : nullptr;
-    if (!actions) throw std::runtime_error("allowed_actions must be an array");
+    if (!actions || actions->empty() || actions->size() > 8U)
+        throw std::runtime_error("allowed_actions must be a bounded non-empty array");
     for (const auto &action : *actions) {
         std::string name = action.string_or();
         if (name != "telemetry.configure" && name != "monitor.roots.configure")
@@ -577,7 +602,7 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
             if (rate < 0 || rate > 1) throw std::runtime_error("sample_rate out of range");
         } else if (name == "monitored_roots") {
             const auto *roots = std::get_if<Array>(&value.data);
-            if (!roots) throw std::runtime_error("monitored_roots must be an array");
+            if (!roots || roots->size() > 32U) throw std::runtime_error("monitored_roots must be a bounded array");
             for (const auto &r : *roots) {
                 const std::filesystem::path path(r.string_or());
                 if (!path.is_absolute())
@@ -590,33 +615,145 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
             }
         } else throw std::runtime_error("policy setting rejected: " + name);
     }
-    sqlite3 *db = open_queue(c.store);
-    sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
-    sqlite3_stmt *s = nullptr;
-    sql_check(sqlite3_prepare_v2(db, "SELECT revision FROM policy_state WHERE issuer=?1", -1, &s, nullptr), db, "policy revision read");
-    sqlite3_bind_text(s, 1, issuer.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    std::uint64_t old = rc == SQLITE_ROW ? static_cast<std::uint64_t>(sqlite3_column_int64(s, 0)) : 0;
-    sqlite3_finalize(s);
-    if (revision <= old) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); sqlite3_close(db);
-        throw std::runtime_error("SEA_POLICY_ROLLBACK");
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
+    sqlite3 *db = database.get();
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw std::runtime_error("policy transaction unavailable");
+    try {
+        sqlite3_stmt *s = nullptr;
+        sql_check(sqlite3_prepare_v2(db, "SELECT revision,document FROM policy_state WHERE issuer=?1", -1, &s, nullptr),
+            db, "policy revision read");
+        sql_check(sqlite3_bind_text(s, 1, issuer.c_str(), -1, SQLITE_TRANSIENT), db, "policy issuer bind");
+        const int rc = sqlite3_step(s);
+        std::uint64_t old = 0;
+        std::string old_document;
+        if (rc == SQLITE_ROW) {
+            old = static_cast<std::uint64_t>(sqlite3_column_int64(s, 0));
+            const auto *bytes = static_cast<const char *>(sqlite3_column_blob(s, 1));
+            const int length = sqlite3_column_bytes(s, 1);
+            if (bytes && length > 0) old_document.assign(bytes, static_cast<std::size_t>(length));
+        }
+        sqlite3_finalize(s);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) throw std::runtime_error("policy revision query failed");
+        if (revision < old || (revision == old && (!allow_unchanged || document != old_document)))
+            throw std::runtime_error("SEA_POLICY_ROLLBACK");
+        if (revision == old) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+        sql_check(sqlite3_prepare_v2(db,
+            "INSERT INTO policy_state(issuer,revision,document) VALUES(?1,?2,?3)"
+            " ON CONFLICT(issuer) DO UPDATE SET revision=excluded.revision,document=excluded.document",
+            -1, &s, nullptr), db, "policy prepare");
+        sql_check(sqlite3_bind_text(s, 1, issuer.c_str(), -1, SQLITE_TRANSIENT), db, "policy issuer bind");
+        sql_check(sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(revision)), db, "policy revision bind");
+        sql_check(sqlite3_bind_blob(s, 3, document.data(), static_cast<int>(document.size()), SQLITE_TRANSIENT),
+            db, "policy document bind");
+        const int write_rc = sqlite3_step(s);
+        sqlite3_finalize(s);
+        sql_check(write_rc, db, "policy write");
+        sql_check(sqlite3_prepare_v2(db,
+            "INSERT INTO policy_audit(issuer,revision,action,committed_at) VALUES(?1,?2,'last_good_stored',strftime('%s','now'))",
+            -1, &s, nullptr), db, "policy audit prepare");
+        sql_check(sqlite3_bind_text(s, 1, issuer.c_str(), -1, SQLITE_TRANSIENT), db, "policy audit issuer bind");
+        sql_check(sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(revision)), db, "policy audit revision bind");
+        const int audit_rc = sqlite3_step(s);
+        sqlite3_finalize(s);
+        sql_check(audit_rc, db, "policy audit write");
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("policy atomic commit failed");
+        return true;
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
     }
-    sql_check(sqlite3_prepare_v2(db,
-        "INSERT INTO policy_state(issuer,revision,document) VALUES(?1,?2,?3)"
-        " ON CONFLICT(issuer) DO UPDATE SET revision=excluded.revision,document=excluded.document",
-        -1, &s, nullptr), db, "policy prepare");
-    sqlite3_bind_text(s, 1, issuer.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(revision));
-    sqlite3_bind_blob(s, 3, document.data(), static_cast<int>(document.size()), SQLITE_TRANSIENT);
-    sql_check(sqlite3_step(s), db, "policy commit");
-    sqlite3_finalize(s);
-    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); sqlite3_close(db);
-        throw std::runtime_error("policy atomic commit failed");
+}
+
+void validate_signed_policy(const Config &c, const std::string &file, const std::string &sigfile,
+                            const std::string &pubfile, const std::string &tenant,
+                            const std::string &allowed_root) {
+    const std::string document = read_limited(file, 65536);
+    const std::string signature = read_limited(sigfile, 128);
+    (void)validate_policy_document(c, document, signature, pubfile, tenant, allowed_root, false);
+    std::cout << "{\"valid\":true,\"stored_as\":\"last_good\"}\n";
+}
+
+std::string decode_policy_signature(const std::string &hex) {
+    if (hex.size() != 128U) throw std::runtime_error("policy envelope signature length is invalid");
+    std::string signature;
+    signature.reserve(64U);
+    auto digit = [](unsigned char c) -> int {
+        if (c >= '0' && c <= '9') return static_cast<int>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<int>(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return static_cast<int>(c - 'A' + 10);
+        return -1;
+    };
+    for (std::size_t i = 0; i < hex.size(); i += 2U) {
+        const int high = digit(static_cast<unsigned char>(hex[i]));
+        const int low = digit(static_cast<unsigned char>(hex[i + 1U]));
+        if (high < 0 || low < 0) throw std::runtime_error("policy envelope signature is not hex");
+        signature.push_back(static_cast<char>((high << 4) | low));
     }
-    sqlite3_close(db);
-    std::cout << "{\"valid\":true,\"revision\":" << revision << ",\"applied\":\"atomic_last_good\"}\n";
+    return signature;
+}
+
+std::string latest_local_policy_document(const Config &c) {
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
+    sqlite3_stmt *statement = nullptr;
+    sql_check(sqlite3_prepare_v2(database.get(),
+        "SELECT document FROM policy_state ORDER BY rowid DESC LIMIT 1", -1, &statement, nullptr),
+        database.get(), "policy ETag read prepare");
+    const int rc = sqlite3_step(statement);
+    std::string document;
+    if (rc == SQLITE_ROW) {
+        const auto *bytes = static_cast<const char *>(sqlite3_column_blob(statement, 0));
+        const int length = sqlite3_column_bytes(statement, 0);
+        if (bytes && length > 0) document.assign(bytes, static_cast<std::size_t>(length));
+    } else if (rc != SQLITE_DONE) {
+        sqlite3_finalize(statement);
+        throw std::runtime_error("policy ETag read failed");
+    }
+    sqlite3_finalize(statement);
+    return document;
+}
+
+std::string response_status(const std::string &response) {
+    const std::size_t line_end = response.find("\r\n");
+    if (line_end == std::string::npos || response.compare(0, 9, "HTTP/1.1 ") != 0)
+        throw std::runtime_error("SEA_POLICY_ENVELOPE_INVALID");
+    const std::size_t code_start = 9U;
+    if (line_end < code_start + 3U) throw std::runtime_error("SEA_POLICY_ENVELOPE_INVALID");
+    return response.substr(code_start, 3U);
+}
+
+void fetch_and_validate_policy(const Config &c, const std::string &pubfile,
+                              const std::string &tenant, const std::string &allowed_root) {
+    const std::string prior_document = latest_local_policy_document(c);
+    TlsClientConnection connection(c);
+    std::string request = "GET /v1/agents/self/policy HTTP/1.1\r\nHost: " + c.host + "\r\n";
+    if (!prior_document.empty()) request += "If-None-Match: \"" + sha256(prior_document) + "\"\r\n";
+    request += "Connection: close\r\n\r\n";
+    const std::string response = http_exchange(connection.session.get(), request, {"200", "304"});
+    (void)SSL_shutdown(connection.session.get());
+    if (response_status(response) == "304") {
+        if (prior_document.empty()) throw std::runtime_error("SEA_POLICY_ENVELOPE_INVALID: unexpected 304");
+        std::cout << "{\"policy_status\":\"unchanged\"}\n";
+        return;
+    }
+    const std::size_t header_end = response.find("\r\n\r\n");
+    if (header_end == std::string::npos) throw std::runtime_error("SEA_POLICY_ENVELOPE_INVALID");
+    const std::string body = response.substr(header_end + 4U);
+    const Value envelope = agent::json::Parser(body).parse();
+    if (!envelope.get("schema_version") || envelope.get("schema_version")->string_or() != "policy_envelope.v1")
+        throw std::runtime_error("SEA_POLICY_ENVELOPE_INVALID");
+    const Value *document_value = envelope.get("policy_document");
+    const Value *signature_value = envelope.get("signature_hex");
+    if (!document_value || !signature_value)
+        throw std::runtime_error("SEA_POLICY_ENVELOPE_INVALID");
+    const std::string document = document_value->string_or();
+    const std::string signature = decode_policy_signature(signature_value->string_or());
+    const bool changed = validate_policy_document(c, document, signature, pubfile, tenant, allowed_root, true);
+    std::cout << "{\"policy_status\":\"" << (changed ? "stored_last_good" : "unchanged") << "\"}\n";
 }
 
 void write_pidfile(const std::string &path) {
@@ -640,7 +777,7 @@ int stop_pid(const std::string &path) {
 int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
-            std::cout << "sw-agentd enroll|run|status|doctor|flush|validate-policy|stop [options]\n"
+            std::cout << "sw-agentd enroll|run|status|doctor|flush|sync-policy|validate-policy|stop [options]\n"
                          "TLS options: --endpoint HOST --port PORT --agent-id UUID --ca FILE --cert FILE --key FILE\n"
                          "Storage: --store DIR; policy: --file JSON --signature RAW64 --pubkey PEM --tenant ID --root ABS\n";
             return argc < 2 ? 2 : 0;
@@ -675,6 +812,11 @@ int main(int argc, char **argv) {
         if (command == "validate-policy") {
             validate_signed_policy(c, arg(argc, argv, "--file"), arg(argc, argv, "--signature"),
                 arg(argc, argv, "--pubkey"), arg(argc, argv, "--tenant"), arg(argc, argv, "--root"));
+            return 0;
+        }
+        if (command == "sync-policy") {
+            fetch_and_validate_policy(c, arg(argc, argv, "--pubkey"),
+                arg(argc, argv, "--tenant"), arg(argc, argv, "--root"));
             return 0;
         }
         if (command != "flush" && command != "run") throw std::runtime_error("unknown command");

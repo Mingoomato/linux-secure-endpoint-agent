@@ -10,7 +10,7 @@
 
 ## 2. Client TLS와 HTTP 응답
 
-`client_context`는 TLS client context를 준비하고 최소 TLS 버전, trust CA, client certificate/private key, key 권한, client identity를 확인합니다. `connect_socket`은 `getaddrinfo` 결과 중 loopback 주소만 연결합니다. `send_batch`는 `SSL_set1_host` 또는 IP 검증 설정 뒤 `SSL_connect`를 수행합니다.
+`client_context`는 TLS client context를 준비하고 최소 TLS 버전, trust CA, client certificate/private key, key 권한, client identity를 확인합니다. `connect_socket`은 `getaddrinfo` 결과 중 loopback 주소만 연결합니다. `TlsClientConnection` 생성자는 `SSL_set1_host` 또는 IP 검증 설정 뒤 `SSL_connect`를 수행하고 TLS context, FD, session의 수명을 소유합니다.
 
 요청은 `/v1/agents/self/events:batch`에 `application/json` body와 `Content-Length`를 포함합니다. `http_exchange`는 SSL write 전체를 보내고, 상태 줄과 각 header 문법을 확인합니다. 응답 header는 16 KiB, 본문은 1 MiB까지이고 Content-Length는 정확히 하나여야 합니다. 중복 길이, `Transfer-Encoding`, 잘못된 숫자, truncation, 선언 길이를 넘어온 바이트를 거부합니다. 이벤트 ACK는 HTTP 200이어야 하며 다른 status에서는 ID 배열을 처리하지 않습니다.
 
@@ -20,15 +20,19 @@
 
 `server/src/server.cpp`의 `run_server`가 인증서와 allowlist, SQLite DB를 열고 loopback listener를 만듭니다. `accept4`가 연결마다 close-on-exec FD를 주며, 순차 accept loop가 `serve_one`을 호출합니다.
 
-`serve_one`은 accepted socket에 5초 receive/send timeout을 설정하고 TLS handshake를 진행합니다. client certificate chain을 확인한 뒤 `peer_cn`의 CN이 allowlist에 있는지 확인합니다. 따라서 mTLS 연결을 맺었다는 것만으로 애플리케이션 권한이 생기지 않습니다.
+`serve_one`은 accepted socket에 5초 receive/send timeout을 설정하고 TLS handshake를 진행합니다. client certificate chain을 확인한 뒤 `peer_cn`의 CN이 agent 또는 operator allowlist 중 적절한 역할에 있는지 확인합니다. 따라서 mTLS 연결을 맺었다는 것만으로 애플리케이션 권한이 생기지 않습니다.
 
 HTTP 문법은 `server/include/agent/http.hpp`에 있는 순수 함수로 분리되어 있습니다. `parse_request_head`는 header delimiter가 아직 도착하지 않았으면 `nullopt`를 반환하고, 완성되면 `RequestHead`에 header 크기와 선언 body 길이를 둡니다. `parse_request`는 framing 길이가 정확히 맞을 때 body를 복사해 소유형 `Request`를 만듭니다. `read_request`는 TLS `SSL_read` 조각을 누적하고 이 두 함수를 이용해 요청이 완성될 때까지 읽습니다. request line은 origin-form path와 HTTP/1.1만 허용합니다. header는 최대 16 KiB, body는 1 MiB이며 Host 한 개를 요구하고 POST에는 단일 Content-Length를 요구합니다. event batch endpoint는 `application/json` Content-Type 한 개를 확인합니다. Transfer-Encoding, 중복 Content-Length/Content-Type, GET body, 잘못된 header와 초과 바이트는 처리하지 않습니다.
 
 경로 분기 뒤 event batch는 `ingest`로 갑니다. `ingest`가 JSON batch version, 인증서 identity와 body의 agent ID, 이벤트 수, 민감 키, payload hash를 검증합니다. SQLite transaction은 event ID 고유성으로 중복을 잡습니다. 같은 ID의 sequence와 hash가 동일하면 duplicate ACK에 추가하고, 내용이 다르면 rollback/error가 됩니다. DB commit이 끝난 뒤에만 응답을 작성합니다.
 
-## 4. Policy 검증과 저장
+## 4. Policy 게시·fetch·검증·저장
 
-CLI의 `validate-policy` 경로는 `read_limited`로 크기가 제한된 파일을 읽고 `validate_signed_policy`를 호출합니다. 이 함수는 JSON 해석 전에 원본 파일 bytes의 Ed25519 signature를 검증합니다. 이후 허용 필드, action, 엄격한 UTC expiry, tenant 및 monitored root 범위, revision을 확인합니다. 경로는 기존 디렉터리로 canonicalize한 뒤 구성 요소 단위로 비교하므로 `..`와 외부 symlink를 통한 우회가 거부됩니다. revision은 binary64 JSON number의 양의 정수성과 안전한 숫자 범위를 확인한 뒤 변환합니다. 유효한 새 revision만 DB transaction으로 last-good 상태에 저장하고, 음수 revision이 기존 상태를 바꾸지 않는 통합 확인도 있습니다. server의 policy GET 경로는 현재 변경 없는 응답을 주며 실제 배포·적용 기능은 구현되지 않았습니다.
+Server 시작 시 `run_server`는 `--operators`, `--admin-token-file`, `--policy-key`, `--tenant`를 읽습니다. `read_admin_token`은 server process 소유 일반 파일과 제한된 권한을 확인하고, `load_policy_signing_key`는 Ed25519 private key의 종류와 권한을 검사합니다. `/v1/admin/policies` 요청은 operator mTLS identity와 bearer token을 모두 요구합니다. `valid_admin_authorization`은 길이를 먼저 확인한 뒤 `CRYPTO_memcmp`로 token을 비교합니다.
+
+`publish_policy`는 먼저 `validate_publishable_policy`로 허용 필드·tenant·시간·revision·action·settings 크기를 확인하고 raw document를 Ed25519 서명합니다. `BEGIN IMMEDIATE` 안에서 현재 revision을 읽고 같은 revision과 동일 bytes인 재요청만 idempotent로 승인합니다. 더 낮거나 같은 revision의 다른 문서는 거부하고, 새 문서/서명은 `policies` 행으로 교체한 뒤 commit합니다. 새 publication은 201, 동일 재전송은 200입니다. Agent GET은 document SHA-256을 ETag로 돌려주며, `If-None-Match`가 일치하면 본문 없는 304를 반환합니다.
+
+Agent의 `sync-policy`는 local last-good 문서가 있으면 그 SHA-256을 `If-None-Match`로 보냅니다. 304면 저장 상태를 변경하지 않습니다. 200 envelope면 signature hex를 64 raw bytes로 디코드하고 `validate_policy_document`를 호출합니다. 이 함수는 raw bytes signature를 JSON parse 전에 검증하고, 허용 schema·issuer/tenant scope·issued/expiry calendar time·safe integer revision·action·setting·canonical root containment를 검사합니다. `BEGIN IMMEDIATE` 뒤 monotonic revision을 재검사하고 `policy_state` 교체와 `policy_audit` 추가를 한 transaction에서 commit합니다. 실패하면 rollback되어 기존 last-good document와 audit가 그대로 남습니다. `validate-policy`는 파일 기반 동일 validator를 호출하는 독립 연습 경로입니다. 저장된 설정을 실제 collector에 적용하는 runtime hook은 아직 없으므로 DB 저장을 정책 실행으로 간주하지 마세요.
 
 ## 5. 예외와 소유권 추적
 
@@ -38,6 +42,6 @@ Agent와 Server의 `SSL_CTX`/`SSL*`는 `unique_ptr`를 사용하며 연결 socke
 
 ## 6. 회귀 테스트
 
-`tests/smoke.sh`는 임시 디렉터리에서 로컬 CA를 만들고 loopback mTLS 연결, event ACK, deduplication, 충돌 ID 거부, allowlist 거부, 정책 signature/tamper/replay를 확인합니다. 정책 회귀 사례는 허용 루트 외부를 가리키는 `..`와 symlink, 달력상 존재하지 않는 날짜를 거부하는지 검사합니다. HTTP 음성 사례는 duplicate Content-Length, Transfer-Encoding, 잘못된/초과 길이, 누락 길이, HTTP/1.0, GET body, 중복 Host, 초과 header와 incomplete body timeout을 검사합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
+`tests/smoke.sh`는 임시 CA, operator token, operator/agent certificate를 만들고 loopback mTLS, 역할 분리, bearer token 누락, event ACK/deduplication, policy publication 201/idempotent 200, exact ETag 304, agent `sync-policy`를 검사합니다. 서명된 higher revision에서 monitored root가 허용 범위를 벗어나면 sync가 거부되고 last-good/audit가 바뀌지 않는지 확인한 뒤 유효한 더 높은 revision으로 복구합니다. 그 밖에 signature tamper/replay, 음수·분수·unsafe revision, `..`와 symlink path, 잘못된 calendar date, malformed HTTP framing을 확인합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
 
 `tests/json_parser_test.cpp`는 같은 테스트를 Agent와 Server의 JSON parser 사본 각각에 컴파일합니다. `tests/http_parser_test.cpp`는 순수 HTTP parser의 정상·거부 경계와 크기 상한을 socket 없이 확인합니다. `tests/http_parser_fuzz.cpp`는 `-DSEA_BUILD_HTTP_FUZZER=ON`으로 별도 빌드하며, `tests/http_fuzz_corpus` seed로 libFuzzer 입력을 변형합니다. 이 구조는 두 JSON parser 사본의 drift를 줄이는 회귀 장치이지, 두 구현이 같음을 증명하거나 Unicode 전체를 처리한다는 뜻은 아닙니다. HTTP fuzz 입력은 짧은 개발 실행을 통과했지만 장기 fuzz campaign은 별도 검증입니다.

@@ -54,4 +54,22 @@
 39. 이 저장소의 `enroll` 또는 `doctor` 응답이 실제 server-side enrollment를 증명하는지 코드에서 어떻게 판별하나요?
 40. JSON revision을 `double`에서 unsigned/SQLite 정수로 바꾸기 전에 양의 정수성과 안전 정밀도 범위를 검사해야 하는 이유는 무엇이며, 거부 시 어떤 last-good 상태를 확인해야 하나요?
 
+## 정책 제어면 추가 방어
+
+41. `/v1/admin/policies` 처리에서 operator certificate allowlist, bearer token, tenant scope 검사는 각각 어떤 위협을 다루며 왜 서로 대체할 수 없나요?
+42. `read_admin_token`은 파일 소유자·종류·mode를 확인합니다. symlink, group-readable 파일, 줄바꿈이 있는 token, 너무 긴 token은 어떻게 처리해야 하나요?
+43. `valid_admin_authorization`의 constant-time 비교가 완화하는 위험과 완화하지 않는 위험을 구분하고, token이 로그나 예외 메시지에 노출되지 않는 경로를 확인하세요.
+44. `publish_policy`는 exact bytes에 서명합니다. operator가 JSON 필드 순서나 공백만 바꿔 재게시하면 signature와 revision 정책은 어떻게 동작해야 하나요?
+45. 같은 revision과 동일 document의 재요청은 왜 200 idempotent로 취급할 수 있지만, 같은 revision의 다른 document는 거부해야 하나요?
+46. Agent가 잘못된 ETag를 보내 200 전체 envelope를 받는 경우 보안/기능상 결과는 무엇이며, 어떤 검증은 여전히 실행되어야 하나요?
+47. Agent가 304 응답을 받았지만 local last-good document가 없다고 주장하는 상황은 어떤 데이터 일관성 위반이며, 왜 조용히 성공 처리하면 안 되나요?
+48. policy document가 server DB에 저장된 뒤 signature key가 교체되면 기존 정책의 fetch와 검증은 어떻게 영향을 받나요? key versioning/rotation을 어떻게 설계할까요?
+49. Server의 policy row 갱신과 Agent의 last-good/audit 갱신이 서로 다른 DB transaction인 이유는 무엇이며, 네트워크 장애가 발생해도 어떤 불변 조건이 남아야 하나요?
+50. 현재 `policy_state`에 저장된 `telemetry_enabled` 값이 실제 event 생성에 영향을 주는지 코드에서 추적하세요. 저장 상태와 runtime 효과가 다를 때 운영 상태 응답은 어떻게 표현해야 하나요?
+51. ETag가 문서 SHA-256만 포함할 때 signature key ID나 policy issuer가 바뀌면 캐시 동작은 충분한가요? 더 강한 validator를 만들려면 어떤 식별자를 포함해야 하나요?
+52. `If-None-Match` 파서가 중복 헤더를 거부하는 선택과 HTTP 표준의 여러 ETag 문법을 구현하는 선택을 어떤 기준으로 비교하나요?
+53. 서버 단일 처리 loop에서 정책 publish와 telemetry ingestion이 동시에 밀릴 때 지연과 backpressure를 어떤 지표로 보이고 어떻게 제한할까요?
+54. tenant가 여러 개로 확장되면 현재 `--tenant` 단일 설정과 `policies(tenant_scope PRIMARY KEY)` 구조에서 어떤 권한·쿼리·감사 경계가 달라져야 하나요?
+55. 테스트의 operator 인증 거부·게시·재전송·304 확인만으로 operator lifecycle, token rotation, revocation이 검증되었다고 할 수 없는 이유는 무엇인가요?
+
 Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변을 관찰한 뒤에만 평가합니다. 현재 소유자 학습·재현 상태는 **관찰되지 않음**입니다.

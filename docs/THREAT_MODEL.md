@@ -3,7 +3,7 @@
 ## Trust boundaries
 
 - The endpoint accepts only loopback endpoints by default and validates the server trust chain plus DNS/IP SAN.
-- The server requires mTLS, checks the client CA chain, and authorizes the certificate CN against a local allowlist. A payload agent_id must match that identity.
+- The server requires mTLS and checks the client CA chain. Agent identities and operator identities have separate local CN allowlists; event payload agent_id must match the agent certificate. Policy publication additionally requires an operator bearer token read from a mode-0600 file and compared in constant time.
 - Policies are untrusted even after TLS and require an Ed25519 signature, expiry, monotonic revision, tenant scope, allowlisted actions, and root scope validation.
 - SQLite spool and server DB are local; files are created with restrictive permissions.
 - Both JSON parser copies cap input at 1 MiB, limit nesting, reject duplicate object keys, enforce JSON number grammar, and allow only JSON whitespace.
@@ -14,4 +14,4 @@ Only synthetic health events are generated. The server rejects common sensitive 
 
 ## Residual risks
 
-The server is sequential. Its custom HTTP subset now bounds headers to 16 KiB and bodies to 1 MiB, checks JSON media type and unambiguous framing, and uses a 5 second socket I/O timeout, but it has not been fuzzed and does not provide a total connection deadline or rate limiting. Availability is not hardened. Agent/server JSON parser implementations are duplicated and must stay in sync. Admin policy publication and revocation are disabled. The allowlist is a local text file, and CN is an identity mapping for this lab rather than a complete enrollment system. The server recomputes the payload hash from compact JSON with lexicographically sorted object keys and rejects mismatches. The Agent requires HTTP 200 before interpreting an event ACK. The reference server's policy fetch endpoint returns 304. No HA, production PKI, public network service, or remote execution is provided.
+The server is sequential. Its custom HTTP subset bounds headers to 16 KiB and bodies to 1 MiB, checks JSON media type and unambiguous framing, and uses a 5 second per-I/O timeout, but it does not provide a total connection deadline or rate limiting. Availability is not hardened. Agent/server JSON parser implementations are duplicated and must stay in sync. Admin policy publication and conditional fetch are implemented for the local lab; revocation, certificate enrollment, production RBAC, and runtime enforcement of policy values are not. The allowlists are local text files, and CN is an identity mapping for this lab rather than a complete enrollment system. The server recomputes payload hashes from canonical compact JSON and rejects mismatches. The Agent requires HTTP 200 for event ACKs and accepts HTTP 200/304 for policy fetch. No HA, production PKI, public network service, or remote execution is provided.

@@ -18,6 +18,8 @@ struct Request {
     std::string path;
     std::string body;
     std::string content_type;
+    std::string authorization;
+    std::string if_none_match;
 };
 
 struct RequestHead {
@@ -92,6 +94,8 @@ inline std::optional<RequestHead> parse_request_head(std::string_view raw) {
 
     bool have_length = false;
     bool have_content_type = false;
+    bool have_authorization = false;
+    bool have_if_none_match = false;
     unsigned host_count = 0;
     std::size_t pos = first_end + 2U;
     while (pos < headers.size()) {
@@ -120,6 +124,14 @@ inline std::optional<RequestHead> parse_request_head(std::string_view raw) {
             if (have_content_type) throw std::runtime_error("duplicate Content-Type");
             head.request.content_type.assign(value);
             have_content_type = true;
+        } else if (normalized == "authorization") {
+            if (have_authorization) throw std::runtime_error("duplicate Authorization");
+            head.request.authorization.assign(value);
+            have_authorization = true;
+        } else if (normalized == "if-none-match") {
+            if (have_if_none_match) throw std::runtime_error("duplicate If-None-Match");
+            head.request.if_none_match.assign(value);
+            have_if_none_match = true;
         } else if (normalized == "transfer-encoding") {
             throw std::runtime_error("Transfer-Encoding is unsupported");
         }
