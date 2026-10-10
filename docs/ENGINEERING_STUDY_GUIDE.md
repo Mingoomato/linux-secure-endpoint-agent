@@ -2,15 +2,16 @@
 
 ## 학습 목표와 현재 상태
 
-이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
+이 저장소는 합성 상태 이벤트와 사용자가 명시적으로 전달한 단일 `event.v1` 레코드를 loopback control server로 보내는 교육용 endpoint agent입니다. durable queue, mTLS, Ed25519 정책, 제한된 관리자 API를 함께 구현해 transport 인증·정책 발급자 인증·재전송·최소 수집 경계를 학습하도록 제작했습니다. `import-event`는 이벤트 문서만 읽고 대상 파일은 열지 않으며, 정책 root를 검사한 뒤 경로를 HMAC 가명화합니다. 자동 파일 감시, 개인 파일 내용 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구, no-policy 차단, telemetry 비활성 큐 보존, sample rate 적용을 확인합니다. 추가로 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부합니다. 1초 TLS handshake deadline 아래 불완전 ClientHello trickle과 1.5초 HTTP request deadline 아래 slow-client 종료도 각각 통합 시험에서 확인합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. `telemetry_enabled`와 `sample_rate`는 합성 telemetry 경로에 적용되지만 `monitored_roots` 실제 파일 감시, production enrollment/revocation/RBAC, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC Release, Clang Release, GCC ASan/UBSan, Clang ASan/UBSan 네 구성에서 CTest가 각각 4/4 통과했고 변경된 agent Clang 정적 분석도 진단이 없었습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구, no-policy 차단, telemetry 비활성 큐 보존, sample rate 적용을 확인합니다. 추가로 `event.v1` 입력은 활성 정책 root 안의 경로만 받아 HMAC ID로 바꾸고, sample suppression, 중복, pathless degraded coverage와 unknown/sensitive field 거부를 확인합니다. Smoke는 target file marker가 spool에 들어가지 않으며 server ACK까지 연결됨을 확인합니다. 그 외 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision, 1초 TLS handshake deadline 아래 incomplete ClientHello와 1.5초 HTTP request deadline 아래 slow-client 종료를 시험합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. 자동 file watcher, production enrollment/revocation/RBAC, malformed/import key fault·경합·history exhaustion, 확장 restart/offline/expiry 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
 | 하위 시스템 | 목적 | 주요 코드 |
 |---|---|---|
 | 합성 이벤트 생성 | 실제 파일이나 사용자 데이터 없이 전달 경로를 재현합니다. | `enqueue`, `run` 명령 |
+| event.v1 importer | 별도 01–05 producer와 결합하지 않고 공통 event 계약을 통해 명시적으로 통합합니다. | `import_event`, `normalize_imported_event`, `pseudonymize_path` |
 | 내구성 있는 agent 큐 | 서버 연결이 끊겨도 이벤트를 보존하고, 확인된 ID만 삭제합니다. | `open_queue`, `next_sequence`, `pending`, `delete_acked` |
 | TLS client | 서버 인증서와 SAN을 검증하고 client 인증서를 제시합니다. | `client_context`, `connect_socket`, `send_batch` |
 | ACK와 재시도 | 모호한 응답이나 전송 실패 뒤에도 데이터를 잃지 않게 합니다. | `ack_ids`, `flush` |
@@ -33,6 +34,16 @@ GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 �
 4. `pending`은 sequence 순서로 제한된 batch를 가져옵니다. `send_batch`는 CA, client 인증서, private-key 권한, CN, loopback 주소와 서버 DNS/IP SAN을 검증한 뒤 OpenSSL TLS 연결을 엽니다.
 5. `flush`는 전송할 때마다 `active_policy`를 다시 확인합니다. telemetry가 비활성·만료면 네트워크 전송을 멈추고 DB queue 행을 그대로 둡니다. `sample_rate=0`은 새 이벤트 생성만 막으므로, telemetry가 켜져 있으면 이전에 쌓인 행을 전송할 수 있습니다. HTTP 요청은 `application/json`과 정확한 `Content-Length`를 포함합니다. event 응답 파서는 header 16 KiB·body 1 MiB 상한, 단일 `Content-Length`, `Transfer-Encoding` 거부, HTTP 200 status와 완전한 본문 길이를 확인합니다. 그 외 status는 ACK로 처리하지 않습니다. 별도 policy fetch는 200/304만 허용합니다. `ack_ids`는 accepted/duplicate ID를 읽고, `flush`는 실제 전송한 batch ID와 대조한 뒤 일치한 항목만 트랜잭션으로 삭제합니다.
 6. 네트워크·파싱 실패는 bounded exponential backoff와 jitter 뒤 재시도합니다. 서버가 commit하고 ACK가 유실되면 다음 전송은 중복으로 판별됩니다.
+
+### event.v1 가져오기와 최소 수집
+
+1. `import-event --file ... --tenant ... --store ...`는 최대 1 MiB의 단일 UTF-8 JSON 문서를 읽습니다. 입력은 producer가 만든 이벤트 메타데이터입니다. `target.path`가 있어도 그 파일을 열거나 읽지는 않습니다.
+2. `normalize_imported_event`는 `event.v1`, UUID, UTC timestamp, source/kind 토큰, actor 숫자, coverage state와 nested allowlist를 검사합니다. 임의 필드는 거부됩니다. 정상 파일 이벤트는 absolute path가 필요하고, pathless 이벤트는 `coverage.*`이며 상태가 `healthy`가 아닐 때만 허용합니다. `host_id`는 확인하지만 mTLS agent identity가 authoritative이므로 forward하지 않습니다.
+3. 경로가 있으면 `weakly_canonical`로 현재 보이는 symlink/`..`를 정규화하고 component 경계 기준으로 활성 policy의 monitored roots 안인지 검사합니다. 대상 파일은 열지 않습니다. 허용된 경우 per-store 32-byte 난수 key를 0600 파일에 생성하고 HMAC-SHA-256을 계산해 `hmac-sha256:<digest>`만 payload에 넣습니다. 원문 경로는 queue envelope, payload, server로 복사되지 않습니다.
+4. JSON object map은 key 정렬 canonical serialization을 하고 payload SHA-256을 계산합니다. `sample_rate`가 0이거나 표본에서 제외되면 영속 row를 만들지 않습니다. 표본에 포함되면 `BEGIN IMMEDIATE` 안에서 sequence 갱신, queue insert, `imported_events` dedup ledger insert를 원자적으로 처리합니다. 같은 event ID와 같은 normalized payload 재가져오기는 `already_seen`, 다른 payload로 같은 ID를 재사용하면 오류입니다. 로컬 dedup ledger 상한은 100,000 ID이며 상한에 닿으면 명시적으로 거부합니다.
+5. 이후 `flush`는 합성 이벤트와 같은 batch/ACK 경로를 사용합니다. 서버는 raw event document나 path를 저장하지 않고 agent/event identity, sequence, payload hash와 수신 시간을 보관합니다.
+
+HMAC path ID는 익명화가 아닙니다. 같은 store에서는 동일 경로를 연결할 수 있고, 전체 store 접근 권한이 있는 공격자는 key를 읽어 후보 경로를 대조할 수 있습니다. store를 복제하면 같은 pseudonym이 유지되므로 이동·초기화 때의 privacy 선택도 고려해야 합니다. 정책 검사와 실제 filesystem 상태 사이에는 race가 있을 수 있지만 이 importer는 대상 파일을 열지 않아 race가 file read를 유도하지는 않습니다.
 
 ### Server 수신과 ingestion
 
@@ -58,16 +69,19 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 ## 동시성, 보안 가정, 실패
 
 - Agent는 한 실행 흐름에서 queue를 처리합니다. 각 이벤트 생성과 각 flush batch 직전에 SQLite의 last-good policy를 다시 읽습니다. `sync-policy`가 다른 process에서 정책을 갱신하면 다음 검사에 반영되지만, 이미 시작한 TLS 요청을 취소하지는 않습니다. Server accept loop도 순차 처리이므로 handshake 또는 느린 요청 하나가 뒤 연결을 지연시킬 수 있습니다. HTTP request deadline은 slow-client의 본문 읽기 점유 시간을 제한하지만 TLS handshake에는 총 deadline이 없고 worker pool이나 rate limit도 없습니다.
+- 동시에 여러 `import-event` process가 같은 store에 쓰면 SQLite `BEGIN IMMEDIATE`가 sequence·queue·dedup history write를 직렬화합니다. busy timeout을 넘거나 disk/DB write가 실패하면 transaction을 rollback하며 row, sequence update, dedup ID의 부분 조합을 남기지 않습니다. queue reader/flush는 WAL에서 진행될 수 있지만 SQLite writer는 한 번에 하나입니다.
 - 가정은 로컬 OS와 DB 디렉터리, CA·정책 signing key, agent/operator allowlist, bearer-token 파일이 신뢰되고 개인키가 저장소 밖에서 보호된다는 것입니다. loopback은 외부 네트워크 노출을 줄일 뿐, 같은 호스트의 다른 프로세스를 인증하거나 격리하지 않습니다.
 - TLS chain 검증과 hostname/IP SAN 검증은 server identity를 확인합니다. Server는 client chain을 검증하고 역할별 CN allowlist를 확인합니다. operator endpoint는 bearer token도 요구하지만 이는 lab 수준의 단순 RBAC입니다. 운영 enrollment, rotation, revocation, SAN URI 기반 identity는 구현되어 있지 않습니다.
 - 오류는 인증서·SAN 오류, TLS truncation, framing 위반, JSON 오류, DB transaction 실패, quota, hash 불일치, 잘못된 ACK, policy signature·scope·revision 실패로 나뉩니다. 새 event는 network 전에 저장되므로 일시 실패에 보존되지만 queue quota 또는 disk full은 저장할 수 없습니다. 정책이 없거나 stale/비활성일 때는 전송을 멈추되 이미 저장된 queue를 삭제하지 않습니다. SQLite 정책 데이터 손상이나 tenant 불일치는 실행 명령을 실패시킵니다.
 - 민감 키 이름 거부는 개인정보 보호의 보조 장치입니다. 완전한 정보 흐름 제어는 아니므로 schema, producer 제한, 권한, 로그 검토가 함께 필요합니다.
+- imported event의 허용 필드, path scope, `telemetry_enabled`, `sample_rate`, local key permission이 실제 전송 경계입니다. `path_id`의 keyed HMAC은 일반 SHA-256보다 외부의 사전 대입을 어렵게 하지만 local key 탈취나 store 전체 열람에는 보호를 제공하지 않습니다. 대상 경로의 완전한 race-free enforcement가 필요한 collector는 directory FD와 `openat2(2)` 같은 별도 설계가 필요합니다.
 
 ## 대안과 설계 교환
 
 - 직접 만든 HTTP framing 파서는 학습에 적합하고 의존성이 적지만 RFC 전체를 구현하지 않습니다. 검증된 HTTP 라이브러리는 parser 표면을 줄여주지만 새 의존성과 통합 복잡성이 생깁니다.
 - 순수 parser를 TLS adapter에서 분리하면 같은 framing 규칙을 단위 테스트와 coverage-guided fuzzing에서 재사용할 수 있습니다. 짧은 libFuzzer 실행은 실행된 입력에서의 sanitizer 결함을 찾는 데 도움을 주지만 무결점이나 RFC 완전성을 증명하지 않습니다.
 - Unix domain socket은 로컬 전용 권한 모델을 단순하게 할 수 있지만 mTLS·SAN 연습을 제공하지 않습니다.
+- raw path를 직접 전송하는 설계는 검색과 서버 상관 분석이 쉽지만 개인정보 노출이 크고, 일반 SHA-256은 후보 경로 사전 대입에 취약합니다. 랜덤 per-event ID는 상관을 어렵게 하지만 같은 파일 이벤트의 분석성을 낮춥니다. 이 lab은 per-store keyed HMAC으로 제한된 상관 가능성과 raw path 비전송을 절충합니다. 운영 환경에서는 키 분리·rotation·보존·사용자 동의에 대한 추가 설계가 필요합니다.
 - bounded worker pool은 처리량을 높일 수 있지만 FD, handshake, queue, DB writer를 함께 제한해야 합니다.
 - fingerprint 또는 SAN URI 기반 ID는 CN allowlist보다 명시적일 수 있지만 enrollment·rotation·revocation 수명주기가 필요합니다.
 - 관리형 JSON 라이브러리는 직접 parser 유지보수와 Unicode edge case를 줄입니다. 반대로 현재 코드의 parser를 읽으면 입력 상한과 허용 문법을 공부할 수 있습니다. agent/server parser 사본이 분리되어 있어 drift 위험이 남습니다.
@@ -82,6 +96,7 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 - Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`connect(2)`](https://man7.org/linux/man-pages/man2/connect.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html)
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_accept`](https://docs.openssl.org/3.0/man3/SSL_accept/), [`SSL_get_error`](https://docs.openssl.org/3.0/man3/SSL_get_error/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
 - OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
+- OpenSSL keyed digest API: [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/)
 - SQLite: [WAL](https://www.sqlite.org/wal.html), [Atomic Commit](https://www.sqlite.org/atomiccommit.html)
 - IETF: [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110), [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)
 - LLVM: [libFuzzer — coverage-guided fuzz testing](https://llvm.org/docs/LibFuzzer.html)

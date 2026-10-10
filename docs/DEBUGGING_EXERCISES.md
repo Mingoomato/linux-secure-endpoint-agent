@@ -2,15 +2,15 @@
 
 아래 세 과제에는 정답 코드나 완성 패치가 없습니다. 과제를 먼저 직접 구현한 뒤에만 본인 기록에 결과와 설명을 남기세요. 인증서는 저장소 밖의 임시 디렉터리에서 만들고, server/client 모두 loopback에서만 실행합니다. 안전 경계를 약화하거나 파일 수집·원격 명령 기능을 추가하지 마세요.
 
-## 실습 1 — ACK와 제출 batch의 경계 검증
+## 실습 1 — `event.v1` import privacy 경계
 
-**목표:** ACK에 현재 batch에 없는 event ID가 섞인 경우, 로컬 queue가 그 ID나 미확인 항목을 제거하지 않음을 독립적으로 검증합니다.
+**목표:** event.v1 path가 정책 scope 안에 있는지 검증하고, queue에 원문 경로나 대상 파일 내용이 들어가지 않는지 독립적으로 재현합니다.
 
-**시작점:** `ack_ids`, `flush`, `delete_acked`, `tests/smoke.sh`.
+**시작점:** `contracts/event-v1.schema.json`, `normalize_imported_event`, `pseudonymize_path`, `tests/smoke.sh`.
 
-Loopback TLS test double을 추가하거나 최소한의 ACK 처리 단위를 분리해, 올바른 accepted/duplicate ID와 외부 ID가 함께 있는 ACK를 재현하세요. 보낸 batch에 속하지 않은 ID를 확인하고 각 응답 뒤의 SQLite queue row를 대조하세요.
+허용 root 안의 경로, root 밖 경로, 민감한 추가 필드, 재사용 event ID를 가진 작은 입력 픽스처를 만드세요. 별도 임시 store에서 import 전후 SQLite queue를 비교하고, 같은 경로가 같은 store에서 일관된 pseudonym을 내는지, 원문 path와 target-file marker가 payload에 없는지 확인하세요.
 
-**완료 기준:** 현재 batch에 속하고 성공/중복으로 확인된 ID만 삭제되며, 미확인 queue 항목은 남는다는 DB 상태 assertion이 있습니다.
+**완료 기준:** 허용 이벤트만 bounded durable queue에 들어가고, 원문 경로·파일 내용은 저장되지 않으며, scope 위반·unknown field·다른 내용의 event ID 재사용이 거부된다는 자동 검증이 있습니다.
 
 ## 실습 2 — 잘못된 새 정책과 last-good 유지
 

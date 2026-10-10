@@ -1,6 +1,7 @@
 #include "agent/json.hpp"
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -25,8 +26,12 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
+#include <initializer_list>
 #include <iostream>
+#include <locale>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -38,6 +43,7 @@
 namespace {
 using agent::json::Value;
 using agent::json::Array;
+using agent::json::Object;
 struct Config {
     std::string host = "127.0.0.1", port = "8443", agent_id, ca, cert, key, store, tenant;
 };
@@ -52,6 +58,7 @@ struct RuntimePolicy {
     std::uint64_t revision = 0;
     double sample_rate = 0.0;
     std::size_t monitored_root_count = 0;
+    std::vector<std::filesystem::path> monitored_roots;
     std::string issuer;
     std::string tenant;
 };
@@ -125,10 +132,20 @@ void sql_check(int rc, sqlite3 *db, const char *where) {
     if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW)
         throw std::runtime_error(std::string(where) + ": " + sqlite3_errmsg(db));
 }
+struct ScopedStatement {
+    sqlite3_stmt *value = nullptr;
+    ~ScopedStatement() { if (value) sqlite3_finalize(value); }
+    ScopedStatement() = default;
+    ScopedStatement(const ScopedStatement &) = delete;
+    ScopedStatement &operator=(const ScopedStatement &) = delete;
+};
 sqlite3 *open_queue(const std::string &store) {
     if (store.empty()) throw std::runtime_error("missing --store");
     std::filesystem::create_directories(store);
-    (void)chmod(store.c_str(), 0700);
+    struct stat store_metadata {};
+    if (lstat(store.c_str(), &store_metadata) != 0 || !S_ISDIR(store_metadata.st_mode) ||
+        store_metadata.st_uid != geteuid() || chmod(store.c_str(), 0700) != 0)
+        throw std::runtime_error("spool directory must be owned by the agent user");
     std::string dbpath = store + "/spool.sqlite";
     sqlite3 *db = nullptr;
     int rc = sqlite3_open_v2(dbpath.c_str(), &db,
@@ -138,12 +155,16 @@ sqlite3 *open_queue(const std::string &store) {
         if (db) sqlite3_close(db);
         throw std::runtime_error("spool database: " + message);
     }
-    (void)chmod(dbpath.c_str(), 0600);
+    if (chmod(dbpath.c_str(), 0600) != 0) {
+        sqlite3_close(db);
+        throw std::runtime_error("spool database permissions could not be restricted");
+    }
     sqlite3_busy_timeout(db, 5000);
     const char *schema =
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
         "CREATE TABLE IF NOT EXISTS queue(event_id TEXT PRIMARY KEY,sequence INTEGER NOT NULL,"
         " observed_at TEXT NOT NULL,payload TEXT NOT NULL,payload_hash TEXT NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS imported_events(event_id TEXT PRIMARY KEY,payload_hash TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS policy_state(issuer TEXT PRIMARY KEY,revision INTEGER NOT NULL,document BLOB NOT NULL);"
         "CREATE TABLE IF NOT EXISTS policy_audit(issuer TEXT NOT NULL,revision INTEGER NOT NULL,"
@@ -159,28 +180,42 @@ sqlite3 *open_queue(const std::string &store) {
     if (rc != SQLITE_OK) { sqlite3_close(db); throw std::runtime_error("sequence metadata unavailable"); }
     return db;
 }
+std::uint64_t next_sequence_in_transaction(sqlite3 *db) {
+    sqlite3_int64 next = 0;
+    {
+        ScopedStatement statement;
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='next_sequence'", -1,
+            &statement.value, nullptr), db, "sequence query");
+        if (sqlite3_step(statement.value) != SQLITE_ROW)
+            throw std::runtime_error("sequence unavailable");
+        const sqlite3_int64 previous = sqlite3_column_int64(statement.value, 0);
+        if (previous < 0 || previous >= INT64_MAX) throw std::runtime_error("sequence exhausted");
+        next = previous + 1;
+    }
+    if (next < 1) throw std::runtime_error("sequence unavailable");
+    const auto sequence = static_cast<std::uint64_t>(next);
+    const std::string value = std::to_string(sequence);
+    ScopedStatement update;
+    sql_check(sqlite3_prepare_v2(db, "UPDATE meta SET value=?1 WHERE key='next_sequence'", -1,
+        &update.value, nullptr), db, "sequence update");
+    sql_check(sqlite3_bind_text(update.value, 1, value.c_str(), -1, SQLITE_TRANSIENT), db, "sequence bind");
+    sql_check(sqlite3_step(update.value), db, "sequence update");
+    if (sqlite3_changes(db) != 1) throw std::runtime_error("sequence update failed");
+    return sequence;
+}
 std::uint64_t next_sequence(sqlite3 *db) {
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
         throw std::runtime_error("sequence transaction unavailable");
-    sqlite3_stmt *s = nullptr;
-    sql_check(sqlite3_prepare_v2(db, "SELECT CAST(value AS INTEGER)+1 FROM meta WHERE key='next_sequence'", -1, &s, nullptr), db, "sequence query");
-    int rc = sqlite3_step(s);
-    if (rc != SQLITE_ROW) {
-        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        throw std::runtime_error("sequence unavailable");
-    }
-    auto n = static_cast<std::uint64_t>(sqlite3_column_int64(s, 0));
-    sqlite3_finalize(s);
-    sql_check(sqlite3_prepare_v2(db, "UPDATE meta SET value=?1 WHERE key='next_sequence'", -1, &s, nullptr), db, "sequence update");
-    std::string value = std::to_string(n);
-    sqlite3_bind_text(s, 1, value.c_str(), -1, SQLITE_TRANSIENT);
-    sql_check(sqlite3_step(s), db, "sequence update");
-    sqlite3_finalize(s);
-    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+    try {
+        const auto sequence = next_sequence_in_transaction(db);
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("sequence commit failed");
+        return sequence;
+    } catch (...) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        throw std::runtime_error("sequence commit failed");
+        throw;
     }
-    return n;
 }
 void enqueue(sqlite3 *db, const std::string &event_id, std::uint64_t sequence, const std::string &observed) {
     sqlite3_stmt *count = nullptr;
@@ -538,8 +573,13 @@ int flush(sqlite3 *db, const Config &c) {
 std::string read_limited(const std::string &path, std::size_t cap) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);
-    std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (data.size() > cap) throw std::runtime_error("input size limit exceeded");
+    std::string data(cap + 1U, '\0');
+    in.read(data.data(), static_cast<std::streamsize>(data.size()));
+    const auto count = in.gcount();
+    if (count < 0 || static_cast<std::size_t>(count) > cap)
+        throw std::runtime_error("input size limit exceeded");
+    if (in.bad()) throw std::runtime_error("input read failed");
+    data.resize(static_cast<std::size_t>(count));
     return data;
 }
 std::time_t parse_policy_time(const std::string &value, const char *field) {
@@ -643,12 +683,429 @@ RuntimePolicy active_policy(sqlite3 *db, const std::string &expected_tenant, boo
         if (!roots || roots->size() > 32U)
             throw std::runtime_error("active policy monitored-roots setting is corrupt");
         for (const auto &path : *roots) {
-            if (path.string_or().empty()) throw std::runtime_error("active policy monitored root is corrupt");
+            const std::string raw_root = path.string_or();
+            const std::filesystem::path configured_root(raw_root);
+            std::error_code path_error;
+            const auto canonical_root = std::filesystem::canonical(configured_root, path_error);
+            if (raw_root.empty() || !configured_root.is_absolute() || path_error ||
+                !std::filesystem::is_directory(canonical_root, path_error) || path_error ||
+                configured_root.lexically_normal() != canonical_root)
+                throw std::runtime_error("active policy monitored root is corrupt");
+            policy.monitored_roots.push_back(canonical_root);
         }
         policy.monitored_root_count = roots->size();
     }
     if (policy.expired) policy.telemetry_enabled = false;
     return policy;
+}
+
+std::string quote_json(const std::string &value) {
+    std::string result = "\"";
+    static constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') {
+            result.push_back('\\');
+            result.push_back(static_cast<char>(c));
+        } else if (c == '\b') result += "\\b";
+        else if (c == '\f') result += "\\f";
+        else if (c == '\n') result += "\\n";
+        else if (c == '\r') result += "\\r";
+        else if (c == '\t') result += "\\t";
+        else if (c < 0x20U) {
+            result += "\\u00";
+            result.push_back(hex[c >> 4U]);
+            result.push_back(hex[c & 0x0fU]);
+        } else result.push_back(static_cast<char>(c));
+    }
+    result.push_back('"');
+    return result;
+}
+std::string canonical_json(const Value &value) {
+    if (std::holds_alternative<std::nullptr_t>(value.data)) return "null";
+    if (const auto *boolean = std::get_if<bool>(&value.data)) return *boolean ? "true" : "false";
+    if (const auto *number = std::get_if<double>(&value.data)) {
+        if (!std::isfinite(*number)) throw std::runtime_error("non-finite JSON number");
+        std::ostringstream output;
+        output.imbue(std::locale::classic());
+        output << std::setprecision(17) << *number;
+        return output.str();
+    }
+    if (const auto *string = std::get_if<std::string>(&value.data)) return quote_json(*string);
+    if (const auto *array = std::get_if<Array>(&value.data)) {
+        std::string output = "[";
+        for (std::size_t i = 0; i < array->size(); ++i) {
+            if (i != 0U) output.push_back(',');
+            output += canonical_json((*array)[i]);
+        }
+        output.push_back(']');
+        return output;
+    }
+    const auto *object = std::get_if<agent::json::Object>(&value.data);
+    if (!object) throw std::runtime_error("unsupported JSON value");
+    std::string output = "{";
+    bool comma = false;
+    for (const auto &[key, item] : *object) {
+        if (comma) output.push_back(',');
+        comma = true;
+        output += quote_json(key) + ':' + canonical_json(item);
+    }
+    output.push_back('}');
+    return output;
+}
+bool safe_token(const std::string &value, std::size_t maximum) {
+    return !value.empty() && value.size() <= maximum &&
+        std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        });
+}
+bool valid_uuid(const std::string &value) {
+    if (value.size() != 36U) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (i == 8U || i == 13U || i == 18U || i == 23U) {
+            if (value[i] != '-') return false;
+        } else if (!std::isxdigit(static_cast<unsigned char>(value[i]))) return false;
+    }
+    return true;
+}
+void require_only_fields(const Value &value, std::initializer_list<const char *> allowed,
+                         const char *where) {
+    const auto *object = std::get_if<agent::json::Object>(&value.data);
+    if (!object) throw std::runtime_error(std::string(where) + " must be an object");
+    for (const auto &[key, child] : *object) {
+        (void)child;
+        const bool found = std::any_of(allowed.begin(), allowed.end(), [&key](const char *name) {
+            return key == name;
+        });
+        if (!found) throw std::runtime_error(std::string(where) + " field rejected: " + key);
+    }
+}
+const Value &required_field(const Value &value, const char *name) {
+    const Value *field = value.get(name);
+    if (!field) throw std::runtime_error(std::string("event field missing: ") + name);
+    return *field;
+}
+double nonnegative_safe_integer(const Value *value, const char *name, bool nullable) {
+    if (!value || std::holds_alternative<std::nullptr_t>(value->data)) {
+        if (nullable) return -1.0;
+        throw std::runtime_error(std::string("event field missing: ") + name);
+    }
+    const auto *number = std::get_if<double>(&value->data);
+    constexpr double maximum = 9007199254740991.0;
+    if (!number || !std::isfinite(*number) || *number < 0.0 || *number > maximum ||
+        std::floor(*number) != *number)
+        throw std::runtime_error(std::string("event field is not a safe non-negative integer: ") + name);
+    return *number;
+}
+std::array<unsigned char, 32> load_or_create_path_key(const std::string &store) {
+    const std::string key_path = store + "/path-pseudonym.key";
+    std::array<unsigned char, 32> key {};
+    int fd = open(key_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+        if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
+            close(fd);
+            unlink(key_path.c_str());
+            throw std::runtime_error("path pseudonym key generation failed");
+        }
+        std::size_t offset = 0;
+        while (offset < key.size()) {
+            const ssize_t written = write(fd, key.data() + offset, key.size() - offset);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                close(fd);
+                unlink(key_path.c_str());
+                OPENSSL_cleanse(key.data(), key.size());
+                throw std::runtime_error("path pseudonym key write failed");
+            }
+            offset += static_cast<std::size_t>(written);
+        }
+        if (fsync(fd) != 0) {
+            close(fd);
+            unlink(key_path.c_str());
+            OPENSSL_cleanse(key.data(), key.size());
+            throw std::runtime_error("path pseudonym key sync failed");
+        }
+        close(fd);
+        const int directory_fd = open(store.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (directory_fd < 0 || fsync(directory_fd) != 0) {
+            if (directory_fd >= 0) close(directory_fd);
+            unlink(key_path.c_str());
+            OPENSSL_cleanse(key.data(), key.size());
+            throw std::runtime_error("path pseudonym directory sync failed");
+        }
+        close(directory_fd);
+        return key;
+    }
+    if (errno != EEXIST) throw std::runtime_error("path pseudonym key create failed");
+
+    fd = open(key_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) throw std::runtime_error("path pseudonym key open failed");
+    struct stat metadata {};
+    if (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_uid != geteuid() || (metadata.st_mode & 0077) != 0 || metadata.st_size != 32) {
+        close(fd);
+        throw std::runtime_error("path pseudonym key permissions or size invalid");
+    }
+    std::size_t offset = 0;
+    while (offset < key.size()) {
+        const ssize_t count = read(fd, key.data() + offset, key.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            close(fd);
+            OPENSSL_cleanse(key.data(), key.size());
+            throw std::runtime_error("path pseudonym key read failed");
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    close(fd);
+    return key;
+}
+std::string pseudonymize_path(const std::string &store, const std::string &raw_path,
+                              const RuntimePolicy &policy) {
+    if (raw_path.empty() || raw_path.size() > 4096U || raw_path.find('\0') != std::string::npos)
+        throw std::runtime_error("event target path is invalid");
+    const std::filesystem::path path(raw_path);
+    if (!path.is_absolute()) throw std::runtime_error("event target path must be absolute");
+    std::error_code error;
+    const auto canonical_path = std::filesystem::weakly_canonical(path, error);
+    if (error || std::none_of(policy.monitored_roots.begin(), policy.monitored_roots.end(),
+            [&canonical_path](const auto &root) { return path_is_within(canonical_path, root); }))
+        throw std::runtime_error("event target outside active monitored roots");
+    const std::string normalized = canonical_path.generic_string();
+    auto key = load_or_create_path_key(store);
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+    unsigned int length = 0;
+    const unsigned char *result = HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+        reinterpret_cast<const unsigned char *>(normalized.data()), normalized.size(), digest.data(), &length);
+    OPENSSL_cleanse(key.data(), key.size());
+    if (!result || length != 32U) throw std::runtime_error("path pseudonym HMAC failed");
+    std::ostringstream output;
+    output << "hmac-sha256:" << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < length; ++i) output << std::setw(2) << static_cast<unsigned>(digest[i]);
+    OPENSSL_cleanse(digest.data(), digest.size());
+    return output.str();
+}
+Value normalize_imported_event(const Value &event, const std::string &store,
+                               const RuntimePolicy &policy, std::string &event_id,
+                               std::string &observed, std::string &kind,
+                               std::string &coverage) {
+    require_only_fields(event, {"schema_version", "event_id", "source", "host_id", "observed_at",
+        "kind", "severity", "target", "actor", "evidence", "coverage"}, "event");
+    if (required_field(event, "schema_version").string_or() != "event.v1")
+        throw std::runtime_error("event schema version unsupported");
+    event_id = required_field(event, "event_id").string_or();
+    if (!valid_uuid(event_id)) throw std::runtime_error("event ID must be a UUID");
+    const std::string source = required_field(event, "source").string_or();
+    if (!safe_token(source, 64U)) throw std::runtime_error("event source is invalid");
+    if (const Value *host = event.get("host_id")) {
+        if (!safe_token(host->string_or(), 128U)) throw std::runtime_error("event host_id is invalid");
+    }
+    observed = required_field(event, "observed_at").string_or();
+    (void)parse_policy_time(observed, "observed_at");
+    kind = required_field(event, "kind").string_or();
+    if (!safe_token(kind, 128U)) throw std::runtime_error("event kind is invalid");
+
+    const Value &target = required_field(event, "target");
+    require_only_fields(target, {"path", "device", "inode"}, "event target");
+    std::string path_id;
+    if (const Value *path = target.get("path")) {
+        const std::string raw_path = path->string_or();
+        if (raw_path.empty()) throw std::runtime_error("event target path is invalid");
+        path_id = pseudonymize_path(store, raw_path, policy);
+    }
+
+    const Value &actor = required_field(event, "actor");
+    require_only_fields(actor, {"pid", "start_time_ticks", "attribution"}, "event actor");
+    const std::string attribution = required_field(actor, "attribution").string_or();
+    if (!safe_token(attribution, 64U)) throw std::runtime_error("event attribution is invalid");
+    const double pid = nonnegative_safe_integer(actor.get("pid"), "actor.pid", true);
+    const double start_ticks = nonnegative_safe_integer(actor.get("start_time_ticks"),
+        "actor.start_time_ticks", true);
+
+    const Value &coverage_value = required_field(event, "coverage");
+    require_only_fields(coverage_value, {"state", "reason"}, "event coverage");
+    coverage = required_field(coverage_value, "state").string_or();
+    if (coverage != "healthy" && coverage != "degraded" && coverage != "unsupported" &&
+        coverage != "recovering")
+        throw std::runtime_error("event coverage state is invalid");
+    Value coverage_reason {nullptr};
+    if (const Value *reason = coverage_value.get("reason")) {
+        if (!std::holds_alternative<std::nullptr_t>(reason->data)) {
+            const std::string reason_text = reason->string_or();
+            if (!safe_token(reason_text, 128U)) throw std::runtime_error("event coverage reason is invalid");
+            coverage_reason = Value{reason_text};
+        }
+    }
+    if (path_id.empty() && !(kind.rfind("coverage.", 0U) == 0U && coverage != "healthy"))
+        throw std::runtime_error("event target path is required outside non-healthy coverage events");
+
+    Value severity_value {std::string("info")};
+    if (const Value *severity = event.get("severity")) {
+        const std::string text = severity->string_or();
+        if (!safe_token(text, 32U)) throw std::runtime_error("event severity is invalid");
+        severity_value = Value{text};
+    }
+    Object target_data;
+    target_data.emplace("path_id", path_id.empty() ? Value{nullptr} : Value{path_id});
+    const double device = nonnegative_safe_integer(target.get("device"), "target.device", true);
+    const double inode = nonnegative_safe_integer(target.get("inode"), "target.inode", true);
+    target_data.emplace("device", device < 0.0 ? Value{nullptr} : Value{device});
+    target_data.emplace("inode", inode < 0.0 ? Value{nullptr} : Value{inode});
+    Object actor_data;
+    actor_data.emplace("attribution", Value{attribution});
+    actor_data.emplace("pid", pid < 0.0 ? Value{nullptr} : Value{pid});
+    actor_data.emplace("start_time_ticks", start_ticks < 0.0 ? Value{nullptr} : Value{start_ticks});
+    Object evidence_data;
+    if (const Value *evidence = event.get("evidence")) {
+        require_only_fields(*evidence, {"source_event", "hash_status"}, "event evidence");
+        if (const Value *source_event = evidence->get("source_event")) {
+            const std::string text = source_event->string_or();
+            if (!safe_token(text, 64U)) throw std::runtime_error("event source_event is invalid");
+            evidence_data.emplace("source_event", Value{text});
+        }
+        if (const Value *hash_status = evidence->get("hash_status")) {
+            const std::string text = hash_status->string_or();
+            if (!safe_token(text, 64U)) throw std::runtime_error("event hash_status is invalid");
+            evidence_data.emplace("hash_status", Value{text});
+        }
+    }
+    Object coverage_data;
+    coverage_data.emplace("reason", std::move(coverage_reason));
+    coverage_data.emplace("state", Value{coverage});
+    Object normalized;
+    normalized.emplace("actor", Value{std::move(actor_data)});
+    normalized.emplace("coverage", Value{std::move(coverage_data)});
+    normalized.emplace("evidence", Value{std::move(evidence_data)});
+    normalized.emplace("severity", std::move(severity_value));
+    normalized.emplace("source", Value{source});
+    normalized.emplace("target", Value{std::move(target_data)});
+    return Value{std::move(normalized)};
+}
+bool sample_rate_admits(const RuntimePolicy &policy) {
+    if (policy.sample_rate <= 0.0) return false;
+    if (policy.sample_rate >= 1.0) return true;
+    std::array<unsigned char, 8> random_bytes {};
+    if (RAND_bytes(random_bytes.data(), static_cast<int>(random_bytes.size())) != 1)
+        throw std::runtime_error("secure random sampling failed");
+    std::uint64_t random_value = 0;
+    for (unsigned char byte : random_bytes) random_value = (random_value << 8U) | byte;
+    constexpr std::uint64_t sample_range = 1ULL << 53U;
+    const std::uint64_t sample = random_value >> 11U;
+    const auto threshold = static_cast<std::uint64_t>(std::floor(policy.sample_rate * static_cast<double>(sample_range)));
+    return sample < threshold;
+}
+std::optional<std::uint64_t> enqueue_imported_event(sqlite3 *db, const std::string &event_id,
+        const std::string &observed, const std::string &kind, const std::string &coverage,
+        const std::string &payload_data) {
+    const std::string payload_hash = sha256(payload_data);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw std::runtime_error("event import transaction unavailable");
+    try {
+        bool duplicate = false;
+        {
+            ScopedStatement existing;
+            sql_check(sqlite3_prepare_v2(db,
+                "SELECT payload_hash FROM imported_events WHERE event_id=?1", -1,
+                &existing.value, nullptr), db, "import dedup prepare");
+            sql_check(sqlite3_bind_text(existing.value, 1, event_id.c_str(), -1, SQLITE_TRANSIENT),
+                db, "import dedup bind");
+            const int rc = sqlite3_step(existing.value);
+            if (rc == SQLITE_ROW) {
+                const auto *stored = reinterpret_cast<const char *>(sqlite3_column_text(existing.value, 0));
+                if (!stored || payload_hash != stored)
+                    throw std::runtime_error("event ID reused with different normalized content");
+                duplicate = true;
+            } else if (rc != SQLITE_DONE) throw std::runtime_error("event import dedup read failed");
+        }
+        if (duplicate) {
+            if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("event import duplicate commit failed");
+            return std::nullopt;
+        }
+        {
+            ScopedStatement count;
+            sql_check(sqlite3_prepare_v2(db, "SELECT count(*) FROM imported_events", -1,
+                &count.value, nullptr), db, "import history count prepare");
+            if (sqlite3_step(count.value) != SQLITE_ROW || sqlite3_column_int64(count.value, 0) >= 100000)
+                throw std::runtime_error("SEA_IMPORT_HISTORY_FULL: local dedup history limit reached");
+        }
+        {
+            ScopedStatement count;
+            sql_check(sqlite3_prepare_v2(db,
+                "SELECT count(*) FROM queue", -1,
+                &count.value, nullptr), db, "queue quota prepare");
+            if (sqlite3_step(count.value) != SQLITE_ROW) throw std::runtime_error("queue size unavailable");
+            const sqlite3_int64 rows = sqlite3_column_int64(count.value, 0);
+            if (rows >= 10000)
+                throw std::runtime_error("SEA_QUEUE_FULL: spool quota reached; event retained nowhere");
+        }
+        const std::uint64_t sequence = next_sequence_in_transaction(db);
+        const std::string envelope = "{\"event_id\":" + quote_json(event_id) +
+            ",\"sequence\":" + std::to_string(sequence) + ",\"observed_at\":" + quote_json(observed) +
+            ",\"kind\":" + quote_json(kind) + ",\"coverage\":" + quote_json(coverage) +
+            ",\"payload\":" + payload_data + ",\"payload_hash\":" + quote_json(payload_hash) + "}";
+        {
+            ScopedStatement count;
+            sql_check(sqlite3_prepare_v2(db,
+                "SELECT COALESCE(sum(length(payload)),0) FROM queue", -1,
+                &count.value, nullptr), db, "queue byte quota prepare");
+            if (sqlite3_step(count.value) != SQLITE_ROW) throw std::runtime_error("queue size unavailable");
+            const sqlite3_int64 bytes = sqlite3_column_int64(count.value, 0);
+            if (bytes + static_cast<sqlite3_int64>(envelope.size()) > 64LL * 1024LL * 1024LL)
+                throw std::runtime_error("SEA_QUEUE_FULL: spool quota reached; event retained nowhere");
+        }
+        {
+            ScopedStatement insert;
+            sql_check(sqlite3_prepare_v2(db,
+                "INSERT INTO queue(event_id,sequence,observed_at,payload,payload_hash) VALUES(?1,?2,?3,?4,?5)",
+                -1, &insert.value, nullptr), db, "event import queue prepare");
+            sql_check(sqlite3_bind_text(insert.value, 1, event_id.c_str(), -1, SQLITE_TRANSIENT), db, "event import id bind");
+            sql_check(sqlite3_bind_int64(insert.value, 2, static_cast<sqlite3_int64>(sequence)), db, "event import sequence bind");
+            sql_check(sqlite3_bind_text(insert.value, 3, observed.c_str(), -1, SQLITE_TRANSIENT), db, "event import time bind");
+            sql_check(sqlite3_bind_text(insert.value, 4, envelope.c_str(), -1, SQLITE_TRANSIENT), db, "event import payload bind");
+            sql_check(sqlite3_bind_text(insert.value, 5, payload_hash.c_str(), -1, SQLITE_TRANSIENT), db, "event import hash bind");
+            sql_check(sqlite3_step(insert.value), db, "event import queue insert");
+        }
+        {
+            ScopedStatement insert;
+            sql_check(sqlite3_prepare_v2(db,
+                "INSERT INTO imported_events(event_id,payload_hash) VALUES(?1,?2)", -1,
+                &insert.value, nullptr), db, "import history prepare");
+            sql_check(sqlite3_bind_text(insert.value, 1, event_id.c_str(), -1, SQLITE_TRANSIENT), db, "import history id bind");
+            sql_check(sqlite3_bind_text(insert.value, 2, payload_hash.c_str(), -1, SQLITE_TRANSIENT), db, "import history hash bind");
+            sql_check(sqlite3_step(insert.value), db, "import history insert");
+        }
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("event import commit failed");
+        return sequence;
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
+    }
+}
+int import_event(const Config &config, const std::string &file) {
+    if (file.empty()) throw std::runtime_error("import-event requires --file");
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(config.store), sqlite3_close);
+    sqlite3 *db = database.get();
+    const RuntimePolicy policy = active_policy(db, config.tenant, true);
+    if (!policy.telemetry_enabled) throw std::runtime_error("SEA_POLICY_INACTIVE: event import is disabled");
+    Value event = agent::json::Parser(read_limited(file, 1024U * 1024U)).parse();
+    std::string event_id, observed, kind, coverage;
+    const Value normalized = normalize_imported_event(event, config.store, policy,
+        event_id, observed, kind, coverage);
+    if (!sample_rate_admits(policy)) {
+        std::cout << "{\"status\":\"sampled_out\",\"event_id\":" << quote_json(event_id) << "}\n";
+        return 0;
+    }
+    const std::string payload_data = canonical_json(normalized);
+    const auto sequence = enqueue_imported_event(db, event_id, observed, kind, coverage, payload_data);
+    if (!sequence) {
+        std::cout << "{\"status\":\"already_seen\",\"event_id\":" << quote_json(event_id) << "}\n";
+        return 0;
+    }
+    std::cout << "{\"status\":\"queued\",\"event_id\":" << quote_json(event_id)
+              << ",\"sequence\":" << *sequence << "}\n";
+    return 0;
 }
 bool validate_policy_document(const Config &c, const std::string &document, const std::string &signature,
                               const std::string &pubfile, const std::string &tenant,
@@ -916,7 +1373,7 @@ int stop_pid(const std::string &path) {
 int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
-            std::cout << "sw-agentd enroll|run|status|doctor|flush|sync-policy|validate-policy|stop [options]\n"
+            std::cout << "sw-agentd enroll|run|status|doctor|flush|import-event|sync-policy|validate-policy|stop [options]\n"
                          "TLS options: --endpoint HOST --port PORT --agent-id UUID --ca FILE --cert FILE --key FILE\n"
                          "Storage: --store DIR; policy: --file JSON --signature RAW64 --pubkey PEM --tenant ID --root ABS\n";
             return argc < 2 ? 2 : 0;
@@ -977,6 +1434,7 @@ int main(int argc, char **argv) {
                 arg(argc, argv, "--tenant"), arg(argc, argv, "--root"));
             return 0;
         }
+        if (command == "import-event") return import_event(c, arg(argc, argv, "--file"));
         if (command != "flush" && command != "run") throw std::runtime_error("unknown command");
         std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
         sqlite3 *db = database.get();

@@ -79,3 +79,19 @@ Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변
 57. `sample_rate=0`일 때 기존 queue를 flush하면서 새 event는 만들지 않는 이유를 코드로 증명하세요. 0과 1 사이의 표본은 어떤 난수 입력과 정수 범위에서 만들어지며, `RAND_bytes` 실패 시 어떤 안전한 동작을 해야 하나요?
 
 58. `accept_tls_with_deadline`에서 nonblocking `SSL_accept`가 `SSL_ERROR_WANT_READ`와 `SSL_ERROR_WANT_WRITE`를 반환할 때 각각 어떤 poll event를 기다리나요? 매 반복에서 deadline 잔여 시간을 다시 계산하고 원래 FD flag를 복구해야 하는 이유를 설명하세요.
+
+## event.v1 import와 개인정보 경계
+
+59. `import-event`가 읽는 파일과 event의 `target.path`가 가리키는 파일은 어떤 차이가 있나요? 코드에서 어느 경로가 실제로 열리고, 파일 content를 수집하지 않는 것을 어떤 테스트가 보여주나요?
+60. 왜 raw path를 SHA-256으로만 해시하지 않고 store별 key를 사용한 HMAC-SHA-256으로 바꾸나요? key 파일의 소유자·mode·크기·symlink 검사와 store 접근자가 갖는 잔여 위험을 설명하세요.
+61. `weakly_canonical`와 component 단위 root 비교는 `..` 및 symlink 경로를 어떻게 다루나요? 검사와 filesystem 변화 사이에 남는 race는 무엇이며, 왜 이 importer를 실제 file watcher의 안전한 open 경계로 볼 수 없나요?
+62. `enqueue_imported_event`의 `BEGIN IMMEDIATE`가 `next_sequence`, `queue`, `imported_events`를 함께 변경하는 이유는 무엇인가요? insert나 commit이 실패하면 각 상태가 어떻게 rollback되어야 하나요?
+63. importer의 local dedup ledger가 event ID와 normalized payload hash를 보관하는 이유는 무엇인가요? ACK 후 같은 입력이 다시 들어오면 어떤 결과를 내며, 100,000건 상한은 용량·재처리 측면에서 어떤 절충을 만드나요?
+64. `sample_rate=0`에서 imported event가 처리되는 순서를 설명하세요. 어떤 검증은 표본 제외 전에 수행되고, 어떤 영속 상태는 남지 않아야 하나요?
+65. pathless `coverage.degraded` 이벤트를 허용하면서 pathless healthy file event를 거부하는 정책은 어떤 데이터/범위 보장을 만드나요? 커널 모듈 상태 이벤트를 연동할 때 어떤 추가 source 규칙이 필요할까요?
+66. imported payload의 canonical JSON SHA-256을 server가 다시 검증하는 흐름을 설명하세요. map key ordering, 숫자 직렬화, path pseudonym이 바뀌면 중복 판정은 어떻게 달라지나요?
+
+67. key file 생성 중 다른 process가 먼저 해당 파일을 열면 어떤 상태가 가능하며, 현재 구현은 이를 어떻게 실패 처리하나요? 동시 import 시험에서 어떤 race를 확인해야 하나요?
+68. per-store HMAC이 같은 경로를 안정적으로 연결하는 장점과 store 복제·key rotation 때 생기는 privacy tradeoff를 설명하세요. per-event nonce나 암호화된 path 보관과 비교해 보세요.
+
+공식 참고: Linux [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), OpenSSL [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/), SQLite [WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html).

@@ -28,6 +28,16 @@ Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subs
 
 `tests/http_parser_test.cpp`는 TLS 연결 없이 경계 조건을 회귀 검사합니다. 선택형 libFuzzer harness는 parser에 임의 바이트를 직접 전달하고, malformed request의 예외는 정상적인 입력 거부로 취급합니다. Clang libFuzzer+ASan+UBSan 100,000회 개발 실행은 실패 없이 완료되었지만, 이는 특정 seed와 짧은 실행의 결과입니다. 전체 RFC 문법, 장시간 안정성, server concurrency나 TLS 상태 전이를 보증하지 않습니다.
 
+## event.v1 import, 경로 가명화와 파일 자원
+
+`import-event`는 1 MiB 제한 안에서 사용자가 지정한 JSON 파일을 읽습니다. C++ stream/`std::string`이 입력 buffer를 소유하고 parser `Value`가 분리된 문자열을 소유합니다. 이 값에서 허용 필드만 새 `Object`로 구성하므로 원본 `target.path`나 `host_id`는 normalized payload에 들어가지 않습니다. Raw path와 canonical path는 함수가 실행되는 동안 사용자 공간 메모리에 잠시 존재하고 종료 시 일반 C++ 객체로 해제되지만, `std::string` 소멸자가 메모리 zeroization을 보장하지는 않습니다. 대상 파일의 FD는 만들지 않으며 file content를 읽지 않습니다.
+
+경로 검사에는 `std::filesystem::weakly_canonical`을 사용합니다. 존재하는 path 구성 요소와 symlink를 현재 파일시스템 상태에 맞게 정규화한 다음 root와 component 단위로 비교합니다. 마지막 파일이 없어도 기존 parent 기준으로 path를 검사할 수 있습니다. 이는 정책 scope를 적용하는 경계지만 descriptor 기반 확정 접근이 아니어서 symlink가 동시에 변경되는 race를 완전히 제거하지 않습니다. Importer가 target을 열지 않기 때문에 이 race가 외부 파일 내용을 읽게 하지는 않으나, 실제 collector로 재사용해서는 안 됩니다.
+
+`path-pseudonym.key`를 처음 만들 때 `open(O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW, 0600)`으로 기존 파일을 덮지 않고 생성하고, `RAND_bytes`로 32 bytes를 채운 뒤 `write`, `fsync`, `close`합니다. 이미 있으면 `open(O_NOFOLLOW)` 후 `fstat`으로 일반 파일, 현재 euid 소유, group/other 권한 없음, 정확히 32 bytes인지 확인한 뒤 `read`합니다. key buffer는 HMAC 계산 후 `OPENSSL_cleanse`로 지웁니다. HMAC은 외부에 raw path를 보내지 않고 같은 store 내 경로 상관을 유지합니다. HMAC은 익명화가 아니며, store와 key 모두에 접근할 수 있는 사람은 알려진 후보 경로를 대조할 수 있습니다.
+
+`enqueue_imported_event`는 SQLite `BEGIN IMMEDIATE` writer transaction 안에서 event ID dedup, queue quota, `next_sequence`, queue row와 `imported_events` hash tombstone을 처리합니다. `COMMIT` 전 실패는 `ROLLBACK`하여 sequence와 dedup만 남는 상태를 피합니다. `sqlite3_stmt`는 `ScopedStatement` 수명 동안만 존재하고 destructor에서 `sqlite3_finalize`합니다. SQLite WAL은 readers와 writer의 일부 동시 작업을 돕지만 writer는 단일 직렬화 자원입니다. 동시에 실행한 import process는 busy timeout을 공유하며, 경합/DB 장애에서 실패하면 importer를 다시 호출할 수 있습니다. HMAC key 파일 생성 직후 다른 process가 읽으면 부분 파일을 관찰할 수 있어 안전한 오류로 거부될 수 있으며, retry 동작은 별도 동시성 시험 대상입니다.
+
 정책 revision 숫자는 JSON parser 안에서 `double`로 표현됩니다. 음수·분수 또는 binary64가 정확히 표현할 수 없는 큰 정수는 unsigned 정수나 SQLite `INTEGER`에 바로 변환하지 말고 먼저 거부해야 합니다. 이 구현은 양의 안전 정수만 저장 가능한 범위로 받고, 음수·소수·`2^53` revision과 기존 last-good 값의 보존을 smoke에서 확인합니다.
 
 ## 저장 정책의 runtime gate와 표본 추출
@@ -54,7 +64,7 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 정책의 monitored root를 사용자 입력 문자열의 접두사 비교만으로 제한하면 안 됩니다. `..` 구성 요소는 allowlist prefix가 문자열에 남아 있어도 다른 디렉터리를 가리킬 수 있고, 심볼릭 링크는 겉으로 보이는 위치와 실제 대상을 분리합니다. Agent는 설정된 허용 디렉터리와 각 요청 경로를 `std::filesystem::canonical`로 정규화해 기존 디렉터리 여부를 확인한 다음 경로 구성 요소를 비교합니다. `/safe/root2`는 `/safe/root`의 하위 경로가 아니므로 텍스트 prefix가 아니라 component 경계가 중요합니다.
 
-이 검사는 정책 문서를 last-good 상태로 저장하기 전의 경로 유효성 검사입니다. runtime status는 root 개수만 보여주며 현재 파일 watcher가 없어 경로를 열거나 파일을 수집하지 않습니다. 미래에 감시를 시작하면서 같은 경로를 다시 사용할 경우 검사와 사용 사이에 symlink가 바뀌는 TOCTOU 경쟁이 남을 수 있으므로, 디렉터리 FD 기반 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해야 합니다.
+정책 sync는 정책 root를 last-good DB에 저장하기 전에 검사하고, `import-event`는 가져온 이벤트 경로를 다시 검사합니다. 현재 실제 파일 watcher가 없어 자동 파일을 열거나 수집하지는 않습니다. Importer의 약한 canonicalization은 root scope에 제한된 pseudonym을 만들기 위한 metadata 검사일 뿐 descriptor 권한 검사가 아닙니다. 실제 감시를 추가할 때는 디렉터리 FD 기준 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해 검사와 open 사이의 TOCTOU를 줄여야 합니다.
 
 ## systemd와 프로세스 경계
 
@@ -63,10 +73,12 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 ## 공식 문서
 
 - Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`setsockopt(2)`](https://man7.org/linux/man-pages/man2/setsockopt.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html), [`close(2)`](https://man7.org/linux/man-pages/man2/close.2.html)
+- Linux man-pages: [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html), [`write(2)`](https://man7.org/linux/man-pages/man2/write.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`fstat(2)`](https://man7.org/linux/man-pages/man2/fstat.2.html)
 - Linux path resolution: [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`realpath(3)`](https://man7.org/linux/man-pages/man3/realpath.3.html)
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_accept`](https://docs.openssl.org/3.0/man3/SSL_accept/), [`SSL_get_error`](https://docs.openssl.org/3.0/man3/SSL_get_error/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
 - Linux man-pages: [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html)
 - OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
+- OpenSSL keyed digest API: [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/)
 - IETF: [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)
 - LLVM: [libFuzzer documentation](https://llvm.org/docs/LibFuzzer.html)
 - SQLite: [WAL](https://www.sqlite.org/wal.html), [Atomic Commit](https://www.sqlite.org/atomiccommit.html)

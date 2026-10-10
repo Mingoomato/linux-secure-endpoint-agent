@@ -8,6 +8,8 @@
 - Sign valid, expired, tampered, stale, wrong-tenant, unsafe-root, and run_command policies; check last-good revision survives failed updates.
 - Verify operator certificate plus bearer-token authorization, policy publish idempotency, ETag/304 fetch, invalid higher-revision rejection, and valid revision recovery.
 - Verify runtime fail-closed behavior with no stored policy, tenant mismatch rejection, disabled telemetry preserving queued rows, `sample_rate=0` suppressing new synthetic events while allowing existing rows to flush, and `sample_rate=1` generating an event. Add expired-policy runtime and concurrent policy-update tests before claiming the full runtime policy matrix.
+- Import a valid `event.v1` record under an active policy. Check queue/server payloads contain an HMAC path ID but no raw path or target-file content; reject paths outside monitored roots, unknown sensitive fields, and pathless healthy file events; allow pathless degraded coverage events; verify duplicate import and `sample_rate=0` behavior.
+- Exercise malformed event fields, invalid UUID/time/numeric bounds, path normalization edge cases, HMAC-key permission failures, concurrent import writers, 100,000-ID dedup-ledger capacity, and transactional rollback on queue/disk failures.
 - Confirm non-loopback bind/endpoint values are refused.
 - Reject TLS handshake deadline settings below 100 ms or above 60,000 ms; verify both inclusive boundaries before using them in a live server test.
 - Use static analysis and sanitizers on user-space code; record 10k-event throughput/RSS only after measurement.

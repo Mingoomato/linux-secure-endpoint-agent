@@ -127,6 +127,14 @@ import json, sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 assert status["policy_status"] == "NO_POLICY" and not status["telemetry_enabled"] and status["queued"] == 0, status
 PY
+cat >"$tmp/no-policy-event.json" <<'EOF'
+{"schema_version":"event.v1","event_id":"a66f9893-76b8-40de-9322-8a84c3d32476","source":"fim","observed_at":"2026-10-10T00:00:01Z","kind":"file.modified","target":{"path":"/tmp/not-imported.txt"},"actor":{"pid":null,"start_time_ticks":null,"attribution":"unknown"},"coverage":{"state":"healthy","reason":null}}
+EOF
+if "$bin_dir/sw-agentd" import-event --file "$tmp/no-policy-event.json" --tenant smoke-tenant --store "$tmp/no-policy-store" >"$tmp/no-policy-import.out" 2>&1; then
+    echo "event.v1 import succeeded without active policy" >&2
+    exit 1
+fi
+grep -q 'SEA_POLICY_INACTIVE: event import is disabled' "$tmp/no-policy-import.out"
 
 python3 - "$certs" "$port" <<'PY'
 import hashlib, json, socket, ssl, sys
@@ -462,6 +470,18 @@ PY
 
 publish_policy_update 5 true 0
 sync_policy "$tmp/agent-store" >"$tmp/agent-policy-sampled-out.json"
+cat >"$tmp/sampled-out-event.json" <<EOF
+{"schema_version":"event.v1","event_id":"d6a70c30-d41e-4cc4-8a61-8e93d75e01a1","source":"fim","observed_at":"2026-10-10T00:00:02Z","kind":"file.modified","target":{"path":"$tmp/allowed-root/sampled.txt"},"actor":{"pid":null,"start_time_ticks":null,"attribution":"unknown"},"coverage":{"state":"healthy","reason":null}}
+EOF
+"$bin_dir/sw-agentd" import-event --file "$tmp/sampled-out-event.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-sampled-out.json"
+python3 - "$tmp/import-sampled-out.json" "$tmp/agent-store/spool.sqlite" <<'PY'
+import json, sqlite3, sys
+assert json.load(open(sys.argv[1], encoding="utf-8"))["status"] == "sampled_out"
+db = sqlite3.connect(sys.argv[2])
+counts = (db.execute("select count(*) from queue").fetchone()[0],
+          db.execute("select count(*) from imported_events").fetchone()[0])
+assert counts == (1, 0), counts
+PY
 "$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
     --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
     --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store"
@@ -475,9 +495,102 @@ assert db.execute("select count(*) from events").fetchone()[0] == 3
 PY
 
 publish_policy_update 6 true 1
+sync_policy "$tmp/agent-store" >"$tmp/agent-policy-import-enabled.json"
 
 mkdir "$tmp/allowed-root/nested" "$tmp/outside-root"
 ln -s "$tmp/outside-root" "$tmp/allowed-root/external-link"
+printf 'private-file-content-marker\n' >"$tmp/allowed-root/nested/example.txt"
+cat >"$tmp/event-v1.json" <<EOF
+{"schema_version":"event.v1","event_id":"c7e9b53b-4644-42e3-9ccc-1fb8bcf76a65","source":"fim","host_id":"local-demo-id","observed_at":"2026-10-10T00:00:03Z","kind":"file.modified","severity":"info","target":{"path":"$tmp/allowed-root/nested/example.txt","device":2049,"inode":18201},"actor":{"pid":null,"start_time_ticks":null,"attribution":"unknown"},"evidence":{"source_event":"IN_CLOSE_WRITE"},"coverage":{"state":"healthy","reason":null}}
+EOF
+"$bin_dir/sw-agentd" import-event --file "$tmp/event-v1.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-event.json"
+python3 - "$tmp/import-event.json" "$tmp/agent-store/spool.sqlite" "$tmp/allowed-root/nested/example.txt" <<'PY'
+import json, sqlite3, sys
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+assert result["status"] == "queued" and result["event_id"] == "c7e9b53b-4644-42e3-9ccc-1fb8bcf76a65", result
+db = sqlite3.connect(sys.argv[2])
+row = db.execute("select payload from queue where event_id=?", (result["event_id"],)).fetchone()
+assert row, "imported event missing from queue"
+stored = row[0]
+assert sys.argv[3] not in stored and '"path"' not in stored and "hmac-sha256:" in stored, stored
+assert "private-file-content-marker" not in stored
+envelope = json.loads(stored)
+assert envelope["kind"] == "file.modified" and envelope["coverage"] == "healthy"
+assert envelope["payload"]["source"] == "fim"
+assert envelope["payload"]["target"]["path_id"].startswith("hmac-sha256:")
+assert db.execute("select count(*) from imported_events").fetchone()[0] == 1
+PY
+"$bin_dir/sw-agentd" import-event --file "$tmp/event-v1.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-event-repeat.json"
+python3 - "$tmp/import-event-repeat.json" "$tmp/agent-store/spool.sqlite" <<'PY'
+import json, sqlite3, sys
+assert json.load(open(sys.argv[1], encoding="utf-8"))["status"] == "already_seen"
+db = sqlite3.connect(sys.argv[2])
+assert db.execute("select count(*) from queue").fetchone()[0] == 1
+PY
+cat >"$tmp/coverage-event.json" <<'EOF'
+{"schema_version":"event.v1","event_id":"55f4d29c-fb4b-4fd7-b74f-0db8317ed7af","source":"fim","observed_at":"2026-10-10T00:00:04Z","kind":"coverage.degraded","severity":"warning","target":{},"actor":{"pid":null,"start_time_ticks":null,"attribution":"unknown"},"coverage":{"state":"degraded","reason":"watcher_restarting"}}
+EOF
+"$bin_dir/sw-agentd" import-event --file "$tmp/coverage-event.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-coverage-event.json"
+python3 - "$tmp/import-coverage-event.json" "$tmp/agent-store/spool.sqlite" <<'PY'
+import json, sqlite3, sys
+assert json.load(open(sys.argv[1], encoding="utf-8"))["status"] == "queued"
+db = sqlite3.connect(sys.argv[2])
+row = db.execute("select payload from queue where event_id=?", ("55f4d29c-fb4b-4fd7-b74f-0db8317ed7af",)).fetchone()
+assert row and json.loads(row[0])["payload"]["target"]["path_id"] is None
+assert db.execute("select count(*) from imported_events").fetchone()[0] == 2
+PY
+python3 - "$tmp/event-v1.json" "$tmp/out-of-scope-event.json" "$tmp/sensitive-event.json" "$tmp/allowed-root/external-link/outside.txt" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1], encoding="utf-8"))
+outside = dict(event)
+outside["event_id"] = "cd7eeb36-d596-4cd8-a2df-e50b2b0ee962"
+outside["target"] = dict(event["target"], path=sys.argv[4])
+json.dump(outside, open(sys.argv[2], "w", encoding="utf-8"), separators=(",", ":"))
+sensitive = dict(event)
+sensitive["event_id"] = "f2bc8527-7972-4c30-a86b-228e998ad8e5"
+sensitive["content"] = "must not enter telemetry"
+json.dump(sensitive, open(sys.argv[3], "w", encoding="utf-8"), separators=(",", ":"))
+PY
+if "$bin_dir/sw-agentd" import-event --file "$tmp/out-of-scope-event.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-out-of-scope.out" 2>&1; then
+    echo "event outside monitored roots was imported" >&2
+    exit 1
+fi
+grep -q 'event target outside active monitored roots' "$tmp/import-out-of-scope.out"
+python3 - "$tmp/event-v1.json" "$tmp/pathless-healthy-event.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1], encoding="utf-8"))
+event["event_id"] = "6d435b39-64cf-4467-988d-a04a25bba5fb"
+event["kind"] = "file.modified"
+event["target"] = {}
+json.dump(event, open(sys.argv[2], "w", encoding="utf-8"), separators=(",", ":"))
+PY
+if "$bin_dir/sw-agentd" import-event --file "$tmp/pathless-healthy-event.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-pathless-healthy.out" 2>&1; then
+    echo "healthy event without a scoped target path was imported" >&2
+    exit 1
+fi
+grep -q 'event target path is required outside non-healthy coverage events' "$tmp/import-pathless-healthy.out"
+if "$bin_dir/sw-agentd" import-event --file "$tmp/sensitive-event.json" --tenant smoke-tenant --store "$tmp/agent-store" >"$tmp/import-sensitive.out" 2>&1; then
+    echo "event with unapproved content field was imported" >&2
+    exit 1
+fi
+grep -q 'event field rejected: content' "$tmp/import-sensitive.out"
+python3 - "$tmp/agent-store/spool.sqlite" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("select count(*) from imported_events").fetchone()[0] == 2
+assert db.execute("select count(*) from queue").fetchone()[0] == 2
+PY
+"$bin_dir/sw-agentd" flush --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/agent-store" >"$tmp/import-flush.out"
+python3 - "$tmp/agent-store/spool.sqlite" "$tmp/server.sqlite" <<'PY'
+import sqlite3, sys
+agent = sqlite3.connect(sys.argv[1])
+assert agent.execute("select count(*) from queue").fetchone()[0] == 0
+server = sqlite3.connect(sys.argv[2])
+assert server.execute("select count(*) from events").fetchone()[0] == 5
+PY
+
 expect_policy_rejected() {
     label=$1
     monitored_root=$2
@@ -641,7 +754,7 @@ import json, sqlite3, sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 assert status["queued"] == 0, status
 db = sqlite3.connect(sys.argv[2])
-assert db.execute("select count(*) from events").fetchone()[0] == 4
+assert db.execute("select count(*) from events").fetchone()[0] == 6
 PY
 
 kill "$server_pid"

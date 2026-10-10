@@ -1,16 +1,54 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "event.v1 input",
+  "$id": "https://linuxsecurity.local/contracts/event-v1.schema.json",
+  "title": "event.v1 local integration input",
+  "description": "A single UTF-8 event record accepted by sw-agentd import-event. The agent normalizes allowlisted metadata before queueing. target.path is pseudonymized with a per-store HMAC key and is never included in the transmitted payload. Pathless input is accepted only for non-healthy coverage.* events. host_id is validated but omitted because the authenticated agent identity is authoritative.",
   "type": "object",
+  "additionalProperties": false,
   "required": ["schema_version", "event_id", "source", "observed_at", "kind", "target", "actor", "coverage"],
   "properties": {
     "schema_version": {"const": "event.v1"},
-    "event_id": {"type": "string"},
-    "source": {"type": "string"},
-    "observed_at": {"type": "string", "format": "date-time"},
-    "kind": {"type": "string"},
-    "target": {"type": "object"},
-    "actor": {"type": "object"},
-    "coverage": {"type": "object"}
+    "event_id": {"type": "string", "format": "uuid"},
+    "source": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"},
+    "host_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"},
+    "observed_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "kind": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"},
+    "severity": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[A-Za-z0-9._-]+$"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/"},
+        "device": {"type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991},
+        "inode": {"type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991}
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attribution"],
+      "properties": {
+        "pid": {"type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991},
+        "start_time_ticks": {"type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991},
+        "attribution": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_event": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"},
+        "hash_status": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["healthy", "degraded", "unsupported", "recovering"]},
+        "reason": {"type": ["string", "null"], "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"}
+      }
+    }
   }
 }

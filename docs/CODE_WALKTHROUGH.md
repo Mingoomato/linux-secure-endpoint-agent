@@ -4,7 +4,7 @@
 
 ## 1. Agent 설정과 내구성 큐
 
-`agent/src/agent.cpp`의 `main`이 하위 명령을 고르고 `Config`를 구성합니다. `is_loopback`은 network command가 외부 host를 대상으로 하지 못하게 제한합니다. `open_queue`는 전용 디렉터리를 준비하고 `spool.sqlite`에서 WAL, `synchronous=FULL`, queue/sequence/policy 테이블을 설정합니다.
+`agent/src/agent.cpp`의 `main`이 하위 명령을 고르고 `Config`를 구성합니다. `is_loopback`은 network command가 외부 host를 대상으로 하지 못하게 제한합니다. `open_queue`는 전용 디렉터리를 준비하고 `spool.sqlite`에서 WAL, `synchronous=FULL`, queue/sequence/imported-event/policy 테이블을 설정합니다.
 
 `run`은 `enqueue_synthetic_if_enabled`를 호출합니다. 이 함수는 `active_policy`로 SQLite의 last-good 정책을 읽고 tenant·revision·schema·expiry·settings·action scope를 다시 확인합니다. 활성 정책이 없거나 만료·비활성이면 새 row를 만들지 않습니다. `sample_rate=0`이면 생성만 억제하고, 0과 1 사이면 OpenSSL `RAND_bytes`를 이용한 균등 53-bit 표본으로 새 이벤트를 선택합니다. 허용된 이벤트에 한해 `next_sequence`가 `BEGIN IMMEDIATE` transaction으로 sequence를 증가시키고, `enqueue`가 고정 합성 상태 payload와 UUID, timestamp, payload hash를 만들고 quota를 확인해 row를 기록합니다. 이 저장이 `send_batch`보다 먼저 일어나는 것이 전송 실패 시 보존의 근거입니다.
 
@@ -15,6 +15,16 @@
 요청은 `/v1/agents/self/events:batch`에 `application/json` body와 `Content-Length`를 포함합니다. `http_exchange`는 SSL write 전체를 보내고, 상태 줄과 각 header 문법을 확인합니다. 응답 header는 16 KiB, 본문은 1 MiB까지이고 Content-Length는 정확히 하나여야 합니다. 중복 길이, `Transfer-Encoding`, 잘못된 숫자, truncation, 선언 길이를 넘어온 바이트를 거부합니다. 이벤트 ACK는 HTTP 200이어야 하며 다른 status에서는 ID 배열을 처리하지 않습니다.
 
 `ack_ids`는 accepted/duplicate 배열을 JSON으로 파싱합니다. `flush`는 각 batch 앞에서 다시 `active_policy`를 확인합니다. telemetry가 비활성·만료면 `flush_paused=policy_inactive`를 출력하고 큐를 삭제하지 않은 채 정상 종료합니다. `sample_rate=0`만으로는 flush가 멈추지 않습니다. 활성 telemetry라면 서버가 돌려준 값이 실제 보낸 ID인지 확인하고 확인된 항목만 SQLite transaction에서 제거합니다. 실패하면 남은 queue로 bounded retry를 반복합니다.
+
+## 1a. `event.v1` 입력, 정규화와 큐 기록
+
+`import-event --file FILE --tenant TENANT --store DIR`은 선택된 JSON event document만 읽습니다. 1 MiB 이상 입력은 거부됩니다. 입력은 producer가 만든 이벤트 메타데이터입니다. `target.path`가 있어도 해당 파일을 열거나 읽지는 않습니다.
+
+`normalize_imported_event`는 `event.v1` 버전, UUID, UTC 초 timestamp, source/kind 토큰, actor 숫자, coverage state와 각 객체의 명시적 allowlist를 확인합니다. 임의 필드는 거부됩니다. 정상 파일 이벤트는 absolute path가 필요하고, pathless 이벤트는 `coverage.*`이며 상태가 `healthy`가 아닐 때만 허용합니다. `host_id`는 확인하지만 mTLS agent identity가 authoritative이므로 forward하지 않습니다.
+
+경로가 있으면 `weakly_canonical`로 현재 보이는 symlink와 `..`를 정규화하고 component 경계 기준으로 활성 policy의 monitored roots 안인지 검사합니다. 허용된 경우 `load_or_create_path_key`가 store 아래 0600 key를 만들거나 읽고, `pseudonymize_path`가 HMAC-SHA-256으로 바꿉니다. 정규화 payload에는 `hmac-sha256:<digest>`만 들어갑니다. 이 importer는 대상 파일을 열지 않습니다.
+
+Canonical JSON payload의 SHA-256을 batch payload hash로 사용합니다. 활성 `telemetry_enabled` 정책이 없으면 import는 실패하고, `sample_rate`에서 제외되면 `sampled_out`으로 반환되어 queue row를 만들지 않습니다. 통과하면 `enqueue_imported_event`의 `BEGIN IMMEDIATE` 안에서 dedup ledger 조회, queue quota 확인, sequence 증가, queue row와 imported ID/hash row를 함께 삽입합니다. 같은 ID와 같은 normalized payload 재가져오기는 `already_seen`, 내용이 다른 ID 재사용은 오류입니다. transaction 실패는 sequence·queue·dedup row를 함께 rollback합니다. local ledger는 100,000 ID로 제한됩니다.
 
 ## 3. Server의 수신부터 ACK까지
 
@@ -42,6 +52,6 @@ Agent와 Server의 `SSL_CTX`/`SSL*`는 `unique_ptr`를 사용하며 연결 socke
 
 ## 6. 회귀 테스트
 
-`tests/smoke.sh`는 임시 CA, operator token, operator/agent certificate를 만들고 loopback mTLS, 1초 absolute handshake deadline 아래 incomplete ClientHello trickle 차단, HTTP request deadline, 역할 분리, bearer token 누락, event ACK/deduplication, policy publication 201/idempotent 200, exact ETag 304, agent `sync-policy`를 검사합니다. 서명된 higher revision에서 monitored root가 허용 범위를 벗어나면 sync가 거부되고 last-good/audit가 바뀌지 않는지 확인한 뒤 유효한 더 높은 revision으로 복구합니다. 그 밖에 signature tamper/replay, 음수·분수·unsafe revision, `..`와 symlink path, 잘못된 calendar date, malformed HTTP framing을 확인합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
+`tests/smoke.sh`는 임시 CA, operator token, operator/agent certificate를 만들고 loopback mTLS, 1초 absolute handshake deadline 아래 incomplete ClientHello trickle 차단, HTTP request deadline, 역할 분리, bearer token 누락, event ACK/deduplication, policy publication 201/idempotent 200, exact ETag 304, agent `sync-policy`를 검사합니다. `event.v1` import는 raw path 대신 HMAC ID가 저장되는지, 대상 파일 content marker를 읽지 않는지, monitored-root 밖 경로와 unknown content field를 거부하는지, pathless degraded coverage를 허용하고 pathless healthy file event를 거부하는지 확인합니다. 같은 ID 재가져오기는 중복 처리하고, sample rate zero에서는 새 import가 생성되지 않습니다. 서명된 higher revision에서 monitored root가 허용 범위를 벗어나면 sync가 거부되고 last-good/audit가 바뀌지 않는지 확인한 뒤 유효한 더 높은 revision으로 복구합니다. 그 밖에 signature tamper/replay, 음수·분수·unsafe revision, `..`와 symlink path, 잘못된 calendar date, malformed HTTP framing을 확인합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
 
 `tests/json_parser_test.cpp`는 같은 테스트를 Agent와 Server의 JSON parser 사본 각각에 컴파일합니다. `tests/http_parser_test.cpp`는 순수 HTTP parser의 정상·거부 경계와 크기 상한을 socket 없이 확인합니다. `tests/http_parser_fuzz.cpp`는 `-DSEA_BUILD_HTTP_FUZZER=ON`으로 별도 빌드하며, `tests/http_fuzz_corpus` seed로 libFuzzer 입력을 변형합니다. 이 구조는 두 JSON parser 사본의 drift를 줄이는 회귀 장치이지, 두 구현이 같음을 증명하거나 Unicode 전체를 처리한다는 뜻은 아닙니다. HTTP fuzz 입력은 짧은 개발 실행을 통과했지만 장기 fuzz campaign은 별도 검증입니다.
