@@ -4,7 +4,7 @@
 
 이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 이는 선택한 로컬 경로의 자동 검증 결과입니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 재시작·오프라인 행렬, fuzzing, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과입니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 확장 재시작·오프라인·만료 행렬, fuzzing, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 

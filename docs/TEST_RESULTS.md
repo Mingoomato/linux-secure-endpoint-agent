@@ -15,7 +15,7 @@
 | Clang 21.1.8 Release 빌드와 CTest | 3/3 통과 |
 | AddressSanitizer + UndefinedBehaviorSanitizer 빌드/CTest | 3/3 통과 |
 | Agent/Server JSON parser 각각의 CTest | 통과. 숫자 grammar, JSON whitespace, 중복 key, 깊이/크기 제한 포함 |
-| loopback mTLS/policy integration | 통과. event ACK, 동일 내용 dedup, ID 내용 충돌 거부, 미등록 client 거부, policy signature/tamper/replay 포함 |
+| loopback mTLS/policy/queue integration | 통과. event ACK, 동일 내용 dedup, ID 내용 충돌 거부, 미등록 client 거부, policy signature/tamper/replay, offline queue 보존과 server 재시작 후 replay 포함 |
 | HTTP framing 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host, header 초과, 미완성 body timeout 확인 |
 | Clang 정적 분석 | 두 C++ 프로그램 모두 진단 없음 |
 | smoke script 구문과 `git diff --check` | 통과 |
@@ -40,7 +40,7 @@ ctest --test-dir build-asan --output-on-failure
 ## 아직 검증하지 않은 항목
 
 - 만료 server/client 인증서, 잘못된 SAN, 다른 CA, certificate rotation/revocation 및 enrollment lifecycle
-- server 또는 agent 재시작, 장시간 offline queue 복구, ACK 유실 fault injection
+- 확장 server/agent 재시작 및 장시간 offline 행렬, expiry/replay 조합, ACK 유실 fault injection (기본 offline queue와 server restart 한 경로는 smoke에서 통과)
 - parser fuzzing, full HTTP grammar, slow-client 총 session deadline, worker pool/동시 연결 부하
 - event/file input, queue quota·disk-full·DB write failure와 retry/backpressure 429 계약
 - production operator RBAC, 정책 server-side signing/distribution, runtime policy apply/rollback hook

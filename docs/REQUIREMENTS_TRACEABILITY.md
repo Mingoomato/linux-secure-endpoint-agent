@@ -24,7 +24,7 @@ The recorded loopback integration and parser tests verify selected mTLS, queue, 
 | SEA-FR-018 | systemd units, PID stop, service controls | SEA-T-014 pending | IN_PROGRESS |
 | SEA-FR-019 | logs omit key/token/payload values | source review pending | IN_PROGRESS |
 | SEA-FR-020 | loopback-only bind/connect | SEA-T-016 pending | IMPLEMENTED |
-| SEA-FR-021 | offline/restart/expiry/replay scenarios | SEA-T-001..014 pending | NOT_STARTED |
+| SEA-FR-021 | offline/restart/expiry/replay scenarios | `tests/smoke.sh` covers one offline queue + server restart + replay recovery; expiry and broader replay matrix pending | IN_PROGRESS |
 | SEA-FR-022 | — | revocation not implemented | NOT_STARTED |
 | SEA-FR-023 | JSON status/queue metrics | diagnostics pending | IN_PROGRESS |
 | SEA-FR-024 | — | optional Go implementation | NOT_APPLICABLE |

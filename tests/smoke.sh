@@ -177,7 +177,64 @@ set -e
 [ "$rc" -ne 0 ]
 grep -q 'SEA_POLICY_ROLLBACK' "$tmp/policy-replay.out"
 
+# Keep an event durable while the server is offline, then deliver it after restart.
 kill "$server_pid"
 wait "$server_pid" || true
 server_pid=
-echo "SEA mTLS/queue/dedup/signature smoke: PASS"
+set +e
+"$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/offline-agent-store" \
+    >"$tmp/offline-agent.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ]
+grep -q 'queue retained:' "$tmp/offline-agent.log"
+"$bin_dir/sw-agentd" status --store "$tmp/offline-agent-store" >"$tmp/offline-before-restart.json"
+python3 - "$tmp/offline-before-restart.json" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["queued"] == 1, status
+PY
+
+"$bin_dir/sw-server" run --bind 127.0.0.1 --port "$port" \
+    --cert "$certs/server.crt" --key "$certs/server.key" --ca "$certs/ca.crt" \
+    --agents "$certs/agents.txt" --db "$tmp/server.sqlite" >"$tmp/server-restart.log" 2>&1 &
+server_pid=$!
+python3 - "$certs" "$port" <<'PY'
+import socket, ssl, sys, time
+certs, port = sys.argv[1], int(sys.argv[2])
+ctx = ssl.create_default_context(cafile=certs + "/ca.crt")
+ctx.load_cert_chain(certs + "/agent.crt", certs + "/agent.key")
+last = None
+for _ in range(100):
+    try:
+        raw = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        raw.settimeout(2)
+        with ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock:
+            sock.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            response = sock.recv(4096)
+        assert response.startswith(b"HTTP/1.1 200 "), response
+        break
+    except (OSError, ssl.SSLError):
+        last = sys.exc_info()[1]
+        time.sleep(0.05)
+else:
+    raise SystemExit("restarted mTLS server did not become ready: " + str(last))
+PY
+"$bin_dir/sw-agentd" flush --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/offline-agent-store"
+"$bin_dir/sw-agentd" status --store "$tmp/offline-agent-store" >"$tmp/offline-after-restart.json"
+python3 - "$tmp/offline-after-restart.json" "$tmp/server.sqlite" <<'PY'
+import json, sqlite3, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["queued"] == 0, status
+db = sqlite3.connect(sys.argv[2])
+assert db.execute("select count(*) from events").fetchone()[0] == 3
+PY
+
+kill "$server_pid"
+wait "$server_pid" || true
+server_pid=
+echo "SEA mTLS/queue/restart/dedup/signature/HTTP framing smoke: PASS"

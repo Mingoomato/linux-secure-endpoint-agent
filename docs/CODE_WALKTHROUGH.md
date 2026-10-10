@@ -38,6 +38,6 @@ Agent와 Server의 `SSL_CTX`/`SSL*`는 `unique_ptr`를 사용하며 연결 socke
 
 ## 6. 회귀 테스트
 
-`tests/smoke.sh`는 임시 디렉터리에서 로컬 CA를 만들고 loopback mTLS 연결, event ACK, deduplication, 충돌 ID 거부, allowlist 거부, 정책 signature/tamper/replay를 확인합니다. HTTP 음성 사례는 duplicate Content-Length, Transfer-Encoding, 잘못된/초과 길이, 누락 길이, HTTP/1.0, GET body, 중복 Host, 초과 header와 incomplete body timeout을 검사합니다.
+`tests/smoke.sh`는 임시 디렉터리에서 로컬 CA를 만들고 loopback mTLS 연결, event ACK, deduplication, 충돌 ID 거부, allowlist 거부, 정책 signature/tamper/replay를 확인합니다. HTTP 음성 사례는 duplicate Content-Length, Transfer-Encoding, 잘못된/초과 길이, 누락 길이, HTTP/1.0, GET body, 중복 Host, 초과 header와 incomplete body timeout을 검사합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
 
 `tests/json_parser_test.cpp`는 같은 테스트를 Agent와 Server의 JSON parser 사본 각각에 컴파일합니다. 이 구조는 두 사본의 drift를 줄이는 회귀 장치이지, 두 구현이 같음을 증명하거나 Unicode 전체를 처리한다는 뜻은 아닙니다.
