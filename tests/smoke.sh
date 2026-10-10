@@ -174,14 +174,16 @@ expect_policy_rejected() {
     label=$1
     monitored_root=$2
     expiry=$3
-    expected=$4
+    revision=$4
+    expected=$5
+    store=${6:-"$tmp/policy-store-$label"}
     policy_file="$tmp/policy-$label.json"
     signature_file="$tmp/policy-$label.sig"
     cat >"$policy_file" <<EOF
-{"schema_version":"policy.v1","policy_id":"smoke-policy-$label","revision":1,"issuer":"smoke-issuer","issued_at":"2026-10-10T00:00:00Z","expires_at":"$expiry","tenant_scope":"smoke-tenant","allowed_actions":["telemetry.configure","monitor.roots.configure"],"settings":{"telemetry_enabled":true,"sample_rate":1,"monitored_roots":["$monitored_root"]}}
+{"schema_version":"policy.v1","policy_id":"smoke-policy-$label","revision":$revision,"issuer":"smoke-issuer","issued_at":"2026-10-10T00:00:00Z","expires_at":"$expiry","tenant_scope":"smoke-tenant","allowed_actions":["telemetry.configure","monitor.roots.configure"],"settings":{"telemetry_enabled":true,"sample_rate":1,"monitored_roots":["$monitored_root"]}}
 EOF
     openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$policy_file" -out "$signature_file"
-    if "$bin_dir/sw-agentd" validate-policy --store "$tmp/policy-store-$label" --file "$policy_file" \
+    if "$bin_dir/sw-agentd" validate-policy --store "$store" --file "$policy_file" \
         --signature "$signature_file" --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant \
         --root "$tmp/allowed-root" >"$tmp/policy-$label.out" 2>&1; then
         echo "policy validation unexpectedly accepted $label" >&2
@@ -189,12 +191,26 @@ EOF
     fi
     grep -q "$expected" "$tmp/policy-$label.out"
 }
-expect_policy_rejected traversal "$tmp/allowed-root/../outside-root" 2099-01-01T00:00:00Z \
+expect_policy_rejected traversal "$tmp/allowed-root/../outside-root" 2099-01-01T00:00:00Z 1 \
     'policy root outside configured allowlist'
-expect_policy_rejected symlink "$tmp/allowed-root/external-link" 2099-01-01T00:00:00Z \
+expect_policy_rejected symlink "$tmp/allowed-root/external-link" 2099-01-01T00:00:00Z 1 \
     'policy root outside configured allowlist'
-expect_policy_rejected invalid-date "$tmp/allowed-root/nested" 2099-02-30T00:00:00Z \
+expect_policy_rejected invalid-date "$tmp/allowed-root/nested" 2099-02-30T00:00:00Z 1 \
     'policy expires_at invalid'
+expect_policy_rejected negative-revision "$tmp/allowed-root" 2099-01-01T00:00:00Z -1 \
+    SEA_POLICY_REVISION_INVALID "$tmp/policy-store"
+expect_policy_rejected fractional-revision "$tmp/allowed-root" 2099-01-01T00:00:00Z 1.5 \
+    SEA_POLICY_REVISION_INVALID
+expect_policy_rejected unsafe-revision "$tmp/allowed-root" 2099-01-01T00:00:00Z 9007199254740992 \
+    SEA_POLICY_REVISION_INVALID
+python3 - "$tmp/policy-store/spool.sqlite" "$tmp/policy.json" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+row = db.execute("select revision, document from policy_state where issuer='smoke-issuer'").fetchone()
+assert row is not None and row[0] == 1
+with open(sys.argv[2], "rb") as policy:
+    assert row[1] == policy.read()
+PY
 
 cp "$tmp/policy.json" "$tmp/policy-tampered.json"
 printf ' ' >>"$tmp/policy-tampered.json"

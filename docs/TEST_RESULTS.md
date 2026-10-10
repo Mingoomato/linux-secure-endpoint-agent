@@ -15,7 +15,7 @@
 | Clang 21.1.8 Release 빌드와 CTest | 4/4 통과 |
 | GCC 16.2 및 Clang 21.1.8 AddressSanitizer + UndefinedBehaviorSanitizer 빌드/CTest | 각각 4/4 통과 |
 | Agent/Server JSON parser 각각의 CTest | 통과. 숫자 grammar, JSON whitespace, 중복 key, 깊이/크기 제한 포함 |
-| loopback mTLS/policy/queue integration | 통과. event ACK, 동일 내용 dedup, ID 내용 충돌 거부, 미등록 client 거부, policy signature/tamper/replay, `..` path traversal·외부 symlink·잘못된 calendar expiry 거부, offline queue 보존과 server 재시작 후 replay 포함 |
+| loopback mTLS/policy/queue integration | 통과. event ACK, 동일 내용 dedup, ID 내용 충돌 거부, 미등록 client 거부, policy signature/tamper/replay, `..` path traversal·외부 symlink·잘못된 calendar expiry·음수/분수/unsafe revision 거부, revision 오류 뒤 기존 DB 정책 문서 보존, offline queue 보존과 server 재시작 후 replay 포함 |
 | HTTP framing 및 media-type 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host/Content-Type, 누락/잘못된 Content-Type, header 초과, 미완성 body timeout, HTTP 400 ACK 거부와 queue 보존 확인 |
 | HTTP parser 직접 단위 테스트 | 통과. 정상 GET/POST, 불완전 head/body, line/header 오류, duplicate framing, 상한, 잘림·추가 바이트 확인 |
 | Clang libFuzzer + ASan/UBSan | seed 3개, `max_len=16384`로 100,000회 통과, crash/sanitizer finding 없음. coverage 627, feature count 2,031로 끝난 짧은 개발 campaign |

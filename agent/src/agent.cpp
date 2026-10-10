@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <cctype>
 #include <cerrno>
@@ -526,10 +527,15 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
     }
     std::string issuer = root.get("issuer") ? root.get("issuer")->string_or() : "";
     std::string policy_tenant = root.get("tenant_scope") ? root.get("tenant_scope")->string_or() : "";
-    std::uint64_t revision = root.get("revision")
-        ? static_cast<std::uint64_t>(root.get("revision")->number_or(0)) : 0;
-    if (issuer.empty() || policy_tenant != tenant || revision == 0)
-        throw std::runtime_error("SEA_SCOPE_INVALID: issuer, tenant scope, or revision invalid");
+    const Value *revision_value = root.get("revision");
+    const double parsed_revision = revision_value ? revision_value->number_or(-1.0) : -1.0;
+    constexpr double kMaxSafeJsonInteger = 9007199254740991.0;
+    if (parsed_revision < 1.0 || parsed_revision > kMaxSafeJsonInteger ||
+        std::floor(parsed_revision) != parsed_revision)
+        throw std::runtime_error("SEA_POLICY_REVISION_INVALID");
+    const auto revision = static_cast<std::uint64_t>(parsed_revision);
+    if (issuer.empty() || policy_tenant != tenant)
+        throw std::runtime_error("SEA_SCOPE_INVALID: issuer or tenant scope invalid");
     std::string expires = root.get("expires_at") ? root.get("expires_at")->string_or() : "";
     std::tm tm {};
     if (expires.size() != 20U || expires.back() != 'Z' ||

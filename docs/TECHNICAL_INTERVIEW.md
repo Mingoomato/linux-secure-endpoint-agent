@@ -52,5 +52,6 @@
 37. ACK에 제출하지 않은 event ID가 포함되면 DB delete가 어떤 기준으로 제한되며, 왜 server response를 그대로 신뢰하면 안 되나요?
 38. 만료 정책을 거부하는 것과 이전 revision을 유지하는 것은 서로 어떤 별개의 불변 조건인가요?
 39. 이 저장소의 `enroll` 또는 `doctor` 응답이 실제 server-side enrollment를 증명하는지 코드에서 어떻게 판별하나요?
+40. JSON revision을 `double`에서 unsigned/SQLite 정수로 바꾸기 전에 양의 정수성과 안전 정밀도 범위를 검사해야 하는 이유는 무엇이며, 거부 시 어떤 last-good 상태를 확인해야 하나요?
 
 Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변을 관찰한 뒤에만 평가합니다. 현재 소유자 학습·재현 상태는 **관찰되지 않음**입니다.

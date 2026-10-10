@@ -17,7 +17,7 @@ The recorded loopback integration and parser tests verify selected mTLS, queue, 
 | SEA-FR-011 | quotas and bounded retry | SEA-T-006/008 pending | IN_PROGRESS |
 | SEA-FR-012 | allowlisted fields/actions and canonical monitored-root containment | tests/smoke.sh (traversal and external symlink rejection); malicious command-key test pending | IN_PROGRESS |
 | SEA-FR-013 | Ed25519 detached signature + tenant scope + strict UTC expiry | tests/smoke.sh (signature tamper, invalid calendar date, replay); expired-policy matrix pending | IN_PROGRESS |
-| SEA-FR-014 | monotonic revision and last-good DB | tests/smoke.sh (replay rejected); failed higher-revision last-good retention test pending | IN_PROGRESS |
+| SEA-FR-014 | positive integral safe revision, monotonic version, and last-good DB | tests/smoke.sh (negative/fractional/unsafe revision rejection, old document retained, replay rejected); expired/wrong-scope update matrix pending | IN_PROGRESS |
 | SEA-FR-015 | validate then transactional last-good swap | SEA-T-011 pending | IN_PROGRESS |
 | SEA-FR-016 | registry, telemetry, heartbeat, status, health routes; bounded HTTP/1.1 framing and JSON media type | `tests/smoke.sh`, `tests/http_parser_test.cpp`, and 100,000-run `tests/http_parser_fuzz.cpp`; route/framing matrix remains partial | IN_PROGRESS |
 | SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection and strict JSON parsing | parser CTests; SEA-T-012 privacy tests pending | IN_PROGRESS |

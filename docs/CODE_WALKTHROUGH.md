@@ -28,7 +28,7 @@ HTTP 문법은 `server/include/agent/http.hpp`에 있는 순수 함수로 분리
 
 ## 4. Policy 검증과 저장
 
-CLI의 `validate-policy` 경로는 `read_limited`로 크기가 제한된 파일을 읽고 `validate_signed_policy`를 호출합니다. 이 함수는 JSON 해석 전에 원본 파일 bytes의 Ed25519 signature를 검증합니다. 이후 허용 필드, action, 엄격한 UTC expiry, tenant 및 monitored root 범위, revision을 확인합니다. 경로는 기존 디렉터리로 canonicalize한 뒤 구성 요소 단위로 비교하므로 `..`와 외부 symlink를 통한 우회가 거부됩니다. 유효한 새 revision만 DB transaction으로 last-good 상태에 저장합니다. server의 policy GET 경로는 현재 변경 없는 응답을 주며 실제 배포·적용 기능은 구현되지 않았습니다.
+CLI의 `validate-policy` 경로는 `read_limited`로 크기가 제한된 파일을 읽고 `validate_signed_policy`를 호출합니다. 이 함수는 JSON 해석 전에 원본 파일 bytes의 Ed25519 signature를 검증합니다. 이후 허용 필드, action, 엄격한 UTC expiry, tenant 및 monitored root 범위, revision을 확인합니다. 경로는 기존 디렉터리로 canonicalize한 뒤 구성 요소 단위로 비교하므로 `..`와 외부 symlink를 통한 우회가 거부됩니다. revision은 binary64 JSON number의 양의 정수성과 안전한 숫자 범위를 확인한 뒤 변환합니다. 유효한 새 revision만 DB transaction으로 last-good 상태에 저장하고, 음수 revision이 기존 상태를 바꾸지 않는 통합 확인도 있습니다. server의 policy GET 경로는 현재 변경 없는 응답을 주며 실제 배포·적용 기능은 구현되지 않았습니다.
 
 ## 5. 예외와 소유권 추적
 

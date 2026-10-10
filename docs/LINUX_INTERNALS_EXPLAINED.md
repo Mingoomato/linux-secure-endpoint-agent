@@ -26,6 +26,8 @@ Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subs
 
 `tests/http_parser_test.cpp`는 TLS 연결 없이 경계 조건을 회귀 검사합니다. 선택형 libFuzzer harness는 parser에 임의 바이트를 직접 전달하고, malformed request의 예외는 정상적인 입력 거부로 취급합니다. Clang libFuzzer+ASan+UBSan 100,000회 개발 실행은 실패 없이 완료되었지만, 이는 특정 seed와 짧은 실행의 결과입니다. 전체 RFC 문법, 장시간 안정성, server concurrency나 TLS 상태 전이를 보증하지 않습니다.
 
+정책 revision 숫자는 JSON parser 안에서 `double`로 표현됩니다. 음수·분수 또는 binary64가 정확히 표현할 수 없는 큰 정수는 unsigned 정수나 SQLite `INTEGER`에 바로 변환하지 말고 먼저 거부해야 합니다. 이 구현은 양의 안전 정수만 저장 가능한 범위로 받고, 음수·소수·`2^53` revision과 기존 last-good 값의 보존을 smoke에서 확인합니다.
+
 ## SQLite transaction과 ACK 의미
 
 WAL은 변경을 `-wal` 파일에 기록하고 checkpoint를 통해 본 DB에 반영합니다. DB와 WAL은 실행 중 함께 상태의 일부이므로 DB 하나만 복사해 일관된 백업이라 가정하면 안 됩니다. WAL은 reader와 writer의 일부 동시 작업을 돕지만 한 번에 하나의 writer를 허용합니다.
