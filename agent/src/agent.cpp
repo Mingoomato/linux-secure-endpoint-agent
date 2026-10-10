@@ -1147,15 +1147,22 @@ class InotifyCollector {
         std::filesystem::path path;
         dev_t device = 0;
     };
+    struct PendingMove {
+        std::filesystem::path path;
+        std::chrono::steady_clock::time_point observed_at;
+    };
     int fd_ = -1;
     std::string store_;
     std::vector<Root> roots_;
     std::map<int, std::filesystem::path> watches_;
+    std::map<std::uint32_t, PendingMove> pending_moves_;
     bool degraded_ = false;
     bool coverage_reported_ = false;
     std::chrono::steady_clock::time_point coverage_retry_after_{};
     std::string degraded_reason_ = "watch_unavailable";
     static constexpr std::size_t kMaxWatchedDirectories = 4096U;
+    static constexpr std::size_t kMaxPendingMoves = 4096U;
+    static constexpr auto kMovePairTimeout = std::chrono::seconds(1);
 
     int open_directory_without_symlinks(const std::filesystem::path &path) const {
         if (!path.is_absolute()) throw std::runtime_error("collector path must be absolute");
@@ -1309,6 +1316,18 @@ class InotifyCollector {
         }
     }
 
+    void flush_pending_moves(sqlite3 *db, const RuntimePolicy &policy, bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = pending_moves_.begin(); it != pending_moves_.end();) {
+            if (!force && now - it->second.observed_at < kMovePairTimeout) {
+                ++it;
+                continue;
+            }
+            process_file_event(db, policy, it->second.path, "file.moved_from", "IN_MOVED_FROM");
+            it = pending_moves_.erase(it);
+        }
+    }
+
 public:
     InotifyCollector(const std::string &store, const RuntimePolicy &policy) : store_(store) {
         fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -1338,7 +1357,12 @@ public:
     InotifyCollector(const InotifyCollector &) = delete;
     InotifyCollector &operator=(const InotifyCollector &) = delete;
 
+    bool ready_for_policy() const {
+        return !degraded_ && !roots_.empty() && !watches_.empty();
+    }
+
     void poll_once(sqlite3 *db, const RuntimePolicy &policy, int timeout_ms) {
+        flush_pending_moves(db, policy, false);
         report_degraded(db, policy);
         pollfd descriptor{fd_, POLLIN, 0};
         const int ready = poll(&descriptor, 1, timeout_ms);
@@ -1381,6 +1405,7 @@ public:
                     degraded_ = true;
                     degraded_reason_ = "inotify_queue_overflow";
                     must_rebuild = true;
+                    flush_pending_moves(db, policy, true);
                     continue;
                 }
                 const auto watch_it = watches_.find(event->wd);
@@ -1398,8 +1423,36 @@ public:
                 }
                 if (event->len == 0U || event->name[0] == '\0') continue;
                 const std::filesystem::path changed = parent / event->name;
+                const bool is_directory = (event->mask & IN_ISDIR) != 0;
+                if (!is_directory && (event->mask & IN_MOVED_FROM) != 0) {
+                    if (event->cookie != 0U) {
+                        const auto existing = pending_moves_.find(event->cookie);
+                        if (existing != pending_moves_.end()) {
+                            process_file_event(db, policy, existing->second.path,
+                                "file.moved_from", "IN_MOVED_FROM");
+                            pending_moves_.erase(existing);
+                        }
+                        if (pending_moves_.size() < kMaxPendingMoves) {
+                            pending_moves_.emplace(event->cookie,
+                                PendingMove{changed, std::chrono::steady_clock::now()});
+                        } else {
+                            process_file_event(db, policy, changed, "file.moved_from", "IN_MOVED_FROM");
+                        }
+                    } else {
+                        process_file_event(db, policy, changed, "file.moved_from", "IN_MOVED_FROM");
+                    }
+                    continue;
+                }
+                if (!is_directory && (event->mask & IN_MOVED_TO) != 0 && event->cookie != 0U) {
+                    const auto from = pending_moves_.find(event->cookie);
+                    if (from != pending_moves_.end()) {
+                        process_file_event(db, policy, changed, "file.renamed", "IN_MOVED_PAIR");
+                        pending_moves_.erase(from);
+                        continue;
+                    }
+                }
                 if ((event->mask & (IN_CREATE | IN_MOVED_TO)) != 0 &&
-                    (event->mask & IN_ISDIR) != 0) {
+                    is_directory) {
                     try {
                         const Root *root = root_for(parent);
                         if (!root) throw std::runtime_error("collector directory outside policy roots");
@@ -1438,6 +1491,7 @@ public:
             }
         }
         if (must_rebuild) (void)rebuild();
+        flush_pending_moves(db, policy, false);
         report_degraded(db, policy);
     }
 };
@@ -1509,6 +1563,11 @@ bool validate_policy_document(const Config &c, const std::string &document, cons
         std::floor(parsed_revision) != parsed_revision)
         throw std::runtime_error("SEA_POLICY_REVISION_INVALID");
     const auto revision = static_cast<std::uint64_t>(parsed_revision);
+    RuntimePolicy staged_policy;
+    staged_policy.present = true;
+    staged_policy.revision = revision;
+    staged_policy.issuer = issuer;
+    staged_policy.tenant = policy_tenant;
     if (policy_id.empty() || policy_id.size() > 128U || issuer.empty() || issuer.size() > 128U ||
         policy_tenant.empty() || policy_tenant != tenant)
         throw std::runtime_error("SEA_SCOPE_INVALID: issuer or tenant scope invalid");
@@ -1549,11 +1608,14 @@ bool validate_policy_document(const Config &c, const std::string &document, cons
     for (const auto &[name, value] : *setting_obj) {
         if (name == "telemetry_enabled") {
             if (!telemetry_action) throw std::runtime_error("telemetry setting requires telemetry.configure");
-            if (!std::get_if<bool>(&value.data)) throw std::runtime_error("telemetry_enabled must be boolean");
+            const auto *enabled = std::get_if<bool>(&value.data);
+            if (!enabled) throw std::runtime_error("telemetry_enabled must be boolean");
+            staged_policy.telemetry_enabled = *enabled;
         } else if (name == "sample_rate") {
             if (!telemetry_action) throw std::runtime_error("sample_rate requires telemetry.configure");
             double rate = value.number_or(-1);
             if (rate < 0 || rate > 1) throw std::runtime_error("sample_rate out of range");
+            staged_policy.sample_rate = rate;
         } else if (name == "monitored_roots") {
             if (!roots_action) throw std::runtime_error("monitored_roots requires monitor.roots.configure");
             const auto *roots = std::get_if<Array>(&value.data);
@@ -1567,8 +1629,16 @@ bool validate_policy_document(const Config &c, const std::string &document, cons
                 if (path_error || !std::filesystem::is_directory(canonical_path, path_error) || path_error ||
                     !path_is_within(canonical_path, canonical_root))
                     throw std::runtime_error("policy root outside configured allowlist");
+                staged_policy.monitored_roots.push_back(canonical_path);
             }
+            staged_policy.monitored_root_count = roots->size();
         } else throw std::runtime_error("policy setting rejected: " + name);
+    }
+    if (staged_policy.telemetry_enabled && staged_policy.sample_rate > 0.0 &&
+        !staged_policy.monitored_roots.empty()) {
+        InotifyCollector staged_collector(c.store, staged_policy);
+        if (!staged_collector.ready_for_policy())
+            throw std::runtime_error("SEA_POLICY_WATCH_PREPARE_FAILED: monitored roots are not fully watchable");
     }
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
     sqlite3 *db = database.get();
@@ -1833,6 +1903,15 @@ int main(int argc, char **argv) {
             std::unique_ptr<InotifyCollector> collector;
             if (should_watch(current_policy))
                 collector = std::make_unique<InotifyCollector>(c.store, current_policy);
+            auto policy_identity = [](const RuntimePolicy &policy) {
+                std::ostringstream identity;
+                identity << policy.issuer << ':' << policy.revision << ':' << policy.expired << ':'
+                         << policy.telemetry_enabled << ':' << std::setprecision(17) << policy.sample_rate;
+                for (const auto &root : policy.monitored_roots) identity << ':' << root.native();
+                return identity.str();
+            };
+            std::string deferred_policy_identity;
+            std::chrono::steady_clock::time_point deferred_retry_after{};
             (void)enqueue_synthetic_if_enabled(db, c.tenant);
             rc = flush(db, c);
 
@@ -1860,11 +1939,26 @@ int main(int argc, char **argv) {
                     refreshed.telemetry_enabled != current_policy.telemetry_enabled ||
                     refreshed.sample_rate != current_policy.sample_rate ||
                     refreshed.monitored_roots != current_policy.monitored_roots;
-                if (policy_changed) {
-                    collector.reset();
-                    current_policy = std::move(refreshed);
-                    if (should_watch(current_policy))
-                        collector = std::make_unique<InotifyCollector>(c.store, current_policy);
+                if (policy_changed && (policy_identity(refreshed) != deferred_policy_identity ||
+                    Clock::now() >= deferred_retry_after)) {
+                    try {
+                        std::unique_ptr<InotifyCollector> staged_collector;
+                        if (should_watch(refreshed)) {
+                            staged_collector = std::make_unique<InotifyCollector>(c.store, refreshed);
+                            if (!staged_collector->ready_for_policy())
+                                throw std::runtime_error("monitored roots are not fully watchable");
+                        }
+                        collector.swap(staged_collector);
+                        current_policy = std::move(refreshed);
+                        deferred_policy_identity.clear();
+                        deferred_retry_after = Clock::time_point{};
+                    } catch (const std::exception &error) {
+                        deferred_policy_identity = policy_identity(refreshed);
+                        deferred_retry_after = Clock::now() +
+                            (sync_interval > 0 ? sync_delay : std::chrono::seconds(60));
+                        std::cerr << "policy activation deferred; last active policy and watches remain active: "
+                                  << error.what() << '\n';
+                    }
                 }
 
                 const auto before_poll = Clock::now();

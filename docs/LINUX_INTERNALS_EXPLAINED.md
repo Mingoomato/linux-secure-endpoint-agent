@@ -84,7 +84,7 @@ Tree traversal은 root에서 시작해 `openat(parent_fd, name, O_DIRECTORY|O_NO
 
 `InotifyCollector`는 장기 inotify FD와 watch descriptor map을 소유합니다. 루트 traversal의 각 FD는 즉시 닫히고, `DIR*`는 `closedir`가 닫습니다. 신호는 `sig_atomic_t` 종료 flag를 세워 poll loop가 자원을 정상 정리하도록 합니다. 하나의 event loop가 inotify 알림, SQLite transaction, queue flush를 처리하므로 이 구현에는 collector worker thread 경쟁이 없습니다.
 
-알림은 파일 내용을 증명하지 않습니다. `IN_CLOSE_WRITE`는 write access가 닫혔다는 신호일 뿐, 내용이 안정됐거나 악성임을 의미하지 않습니다. Rename은 source와 destination directory에서 각각 보고될 수 있고 cookie로 쌍을 이루어야 한다는 제약이 남아 있습니다. Overflow 뒤에는 현재 디렉터리를 다시 watch하지만 놓친 변화의 history를 복구할 baseline scan은 하지 않으므로 degraded coverage를 유지합니다. 정확한 상태 복구가 필요하면 baseline/hash를 가진 FIM subsystem이나 fanotify 기반 설계를 따로 검토해야 합니다.
+알림은 파일 내용을 증명하지 않습니다. `IN_CLOSE_WRITE`는 write access가 닫혔다는 신호일 뿐, 내용이 안정됐거나 악성임을 의미하지 않습니다. 파일 rename은 inotify cookie로 최대 1초 동안 pair하며, 짝이 없는 from/to는 각각 보존합니다. 보류량은 4,096개로 제한됩니다. 디렉터리 이동은 별도 watch 재구성 경로를 따르고 cookie pair는 만들지 않습니다. 이 rename 구현은 추가된 뒤 실행 검증되지 않았습니다. Overflow 뒤에는 현재 디렉터리를 다시 watch하지만 놓친 변화의 history를 복구할 baseline scan은 하지 않으므로 degraded coverage를 유지합니다. 정확한 상태 복구가 필요하면 baseline/hash를 가진 FIM subsystem이나 fanotify 기반 설계를 따로 검토해야 합니다.
 
 ## 공식 문서
 

@@ -36,6 +36,10 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 - Root 외부 symlink, symlink directory, 다른 device mount, directory rename, permission loss, inotify watch cap/overflow를 각각 재현하고 coverage degraded 동작을 확인한다.
 - Running agent에서 revision/root replacement, telemetry disable, expiry, sample-rate update를 적용하고 queue retention/flush 계약을 확인한다.
 - Agent/service stop, restart, `sync-policy` 동시 실행과 quota/full-disk 상황에서 FD, PID file, SQLite transaction lifetime을 관찰한다.
+- Watch preflight가 접근 불가 하위 디렉터리, watch limit, inotify 초기화 실패에서 정책 commit을 막고 직전 last-good row를 보존하는지 확인한다.
+- Runtime reload 중 watch 준비 실패가 기존 collector FD와 기존 정책을 유지하는지, 이후 더 높은 정상 revision에서 교체되는지 확인한다.
+- Watch preflight 완료 뒤 root 권한/마운트가 바뀌는 경쟁 조건과 process restart 후 stored policy 적용을 확인한다.
+- 구현된 파일 rename-cookie pair/mismatch/timeout 경로, 4,096 pending cap, overflow 시 보류 이벤트 배출을 확인한다. 디렉터리 이동은 pair되지 않는다. 누락 event history 복구는 구현되지 않았으므로 별도 baseline 설계가 필요하다.
 
 ## 추가 구현 후 실행할 agent registry 확인 항목
 
