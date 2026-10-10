@@ -6,11 +6,13 @@ Agent는 `getaddrinfo`로 주소를 찾고 loopback 주소만 남긴 뒤 `socket
 
 TCP는 메시지 경계가 없는 순서 있는 byte stream입니다. 한 번의 `send`가 상대편 한 번의 `recv`로 대응한다고 가정할 수 없습니다. 이 프로젝트는 HTTP header 끝과 Content-Length로 application 메시지 경계를 만듭니다. Server는 header 16 KiB, body 1 MiB를 상한으로 두고 ambiguous framing을 거부합니다.
 
-`SO_RCVTIMEO`와 `SO_SNDTIMEO`는 개별 block I/O 대기시간을 설정하는 socket option입니다. 현재 server는 accepted socket에 5초를 적용하고, TLS handshake 뒤 HTTP request read에는 `std::chrono::steady_clock`으로 계산하는 별도의 총 deadline을 둡니다. 기본값은 10초이며 `--request-deadline-ms`에서 100–60,000 ms로 설정합니다. 매번 read할 때 남은 deadline과 5초 중 짧은 timeout을 적용하므로, 조금씩 byte를 보내 개별 timeout을 계속 갱신하려는 client도 HTTP request 수명을 무한히 늘릴 수 없습니다. TLS handshake 자체는 아직 개별 I/O timeout만 가지며 절대 handshake deadline은 아닙니다. 순차 server의 동시성·rate limit 문제도 별도로 남습니다.
+`SO_RCVTIMEO`와 `SO_SNDTIMEO`는 개별 block I/O 대기시간을 설정하는 socket option입니다. 현재 server는 accepted socket에 5초를 적용하고, TLS handshake에는 별도 기본 10초 absolute deadline을 적용합니다. HTTP request read는 TLS/CN 인증 뒤 시작하는 또 다른 10초 deadline을 가집니다. 두 deadline은 각각 `--handshake-deadline-ms`와 `--request-deadline-ms`에서 100–60,000 ms로 설정합니다. HTTP read마다 남은 전체 request deadline과 5초 중 짧은 timeout을 적용하므로, 조금씩 byte를 보내 개별 timeout을 계속 갱신하려는 client도 요청 수명을 무한히 늘릴 수 없습니다. 두 기한 모두 route 처리나 순차 server의 동시성·rate limit 문제를 해결하지는 않습니다.
 
 ## Socket 위의 TLS
 
 OpenSSL의 `SSL*`는 `SSL_set_fd`로 socket에 연결되고 `SSL_accept`/`SSL_connect` handshake와 `SSL_read`/`SSL_write` record I/O를 처리합니다. TLS record와 HTTP body 경계는 서로 다른 계층입니다.
+
+Server는 `SSL_accept` 동안 accepted socket을 nonblocking으로 둡니다. `SSL_accept`가 1을 반환하면 handshake가 끝났고, 그렇지 않으면 직후 `SSL_get_error`로 결과를 분류합니다. `SSL_ERROR_WANT_READ`는 socket을 읽을 수 있게 될 때까지, `SSL_ERROR_WANT_WRITE`는 쓸 수 있게 될 때까지 기다려야 한다는 뜻입니다. `accept_tls_with_deadline`는 요청된 이벤트를 `poll(2)`로 기다리며 매 회 `std::chrono::steady_clock`의 절대 종료 시각에서 남은 시간을 다시 계산합니다. `EINTR`이면 남은 budget으로 재평가하고, deadline이 지나면 handshake를 포기합니다. 종료 후 원래 `fcntl(F_GETFL)` flag를 복구해 기존 blocking `SSL_read` HTTP 경로로 이어집니다. 이 구조가 slow trickle ClientHello가 매번 I/O progress를 만들어도 전체 handshake 제한을 늘리지 않는 이유입니다. 서버는 여전히 단일 연결 처리이므로 만료된 handshake 하나가 최대 handshake budget만큼 accept loop를 점유할 수 있습니다.
 
 Agent는 CA chain과 DNS/IP SAN을 확인하고 client certificate를 제시합니다. Server는 CA를 확인하고 peer certificate의 CN을 역할별 local allowlist와 대조합니다. Policy publication은 별도 operator 인증서와 bearer token을 둘 다 요구합니다. Token은 server-user 소유의 mode-0600 파일에서 읽으며 constant-time 비교로 검사합니다. CN allowlist는 실습용 연결이며 enrollment, revocation, 자동 rotation을 갖춘 PKI는 아닙니다.
 
@@ -62,7 +64,8 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 - Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`setsockopt(2)`](https://man7.org/linux/man-pages/man2/setsockopt.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html), [`close(2)`](https://man7.org/linux/man-pages/man2/close.2.html)
 - Linux path resolution: [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`realpath(3)`](https://man7.org/linux/man-pages/man3/realpath.3.html)
-- OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
+- OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_accept`](https://docs.openssl.org/3.0/man3/SSL_accept/), [`SSL_get_error`](https://docs.openssl.org/3.0/man3/SSL_get_error/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
+- Linux man-pages: [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html)
 - OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
 - IETF: [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)
 - LLVM: [libFuzzer documentation](https://llvm.org/docs/LibFuzzer.html)

@@ -30,6 +30,7 @@
 #include <locale>
 #include <memory>
 #include <optional>
+#include <poll.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -194,6 +195,42 @@ struct ScopedFd {
     ScopedFd &operator=(const ScopedFd &) = delete;
     int get() const { return value; }
 };
+
+enum class HandshakeResult { Complete, TimedOut, Failed };
+
+HandshakeResult accept_tls_with_deadline(SSL *ssl, int socket_fd,
+        std::chrono::milliseconds budget) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    for (;;) {
+        if (stopping) return HandshakeResult::Failed;
+        if (std::chrono::steady_clock::now() >= deadline) return HandshakeResult::TimedOut;
+        const int result = SSL_accept(ssl);
+        const auto after_accept = std::chrono::steady_clock::now();
+        if (result == 1)
+            return after_accept <= deadline ? HandshakeResult::Complete : HandshakeResult::TimedOut;
+
+        const int ssl_error = SSL_get_error(ssl, result);
+        if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE)
+            return HandshakeResult::Failed;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return HandshakeResult::TimedOut;
+        const auto remaining = deadline - now;
+        auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+        if (wait_ms < remaining) wait_ms += std::chrono::milliseconds(1);
+        const int timeout_ms = static_cast<int>(std::max<std::int64_t>(1, wait_ms.count()));
+        pollfd descriptor {};
+        descriptor.fd = socket_fd;
+        descriptor.events = ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+        const int ready = poll(&descriptor, 1, timeout_ms);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return HandshakeResult::Failed;
+        }
+        if (ready == 0) continue;
+        if ((descriptor.revents & POLLNVAL) != 0) return HandshakeResult::Failed;
+    }
+}
 
 std::string json_quote(const std::string &value) {
     std::ostringstream out;
@@ -594,7 +631,8 @@ void ingest(sqlite3 *db, const std::set<std::string> &agents, SSL *ssl,
 
 void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<std::string> &operators,
                const std::string &admin_token, const std::string &tenant, EVP_PKEY *policy_key,
-               SSL_CTX *ctx, int fd, std::chrono::milliseconds request_deadline) {
+               SSL_CTX *ctx, int fd, std::chrono::milliseconds request_deadline,
+               std::chrono::milliseconds handshake_deadline) {
     ScopedFd socket_fd(fd);
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx), SSL_free);
     if (!ssl) return;
@@ -602,7 +640,22 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<
     timeval io_timeout {5, 0};
     (void)setsockopt(socket_fd.get(), SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
     (void)setsockopt(socket_fd.get(), SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
-    if (SSL_accept(ssl.get()) != 1 || SSL_get_verify_result(ssl.get()) != X509_V_OK) {
+    const int original_flags = fcntl(socket_fd.get(), F_GETFL);
+    if (original_flags < 0 || fcntl(socket_fd.get(), F_SETFL, original_flags | O_NONBLOCK) != 0) {
+        std::cerr << "TLS handshake nonblocking setup failed\n";
+        return;
+    }
+    const HandshakeResult handshake = accept_tls_with_deadline(ssl.get(), socket_fd.get(), handshake_deadline);
+    const bool flags_restored = fcntl(socket_fd.get(), F_SETFL, original_flags) == 0;
+    if (!flags_restored) {
+        std::cerr << "TLS socket mode restore failed\n";
+        return;
+    }
+    if (handshake == HandshakeResult::TimedOut) {
+        std::cerr << "TLS handshake absolute deadline exceeded\n";
+        return;
+    }
+    if (handshake != HandshakeResult::Complete || SSL_get_verify_result(ssl.get()) != X509_V_OK) {
         return;
     }
     std::string identity = peer_cn(ssl.get());
@@ -684,6 +737,10 @@ int run_server(int argc, char **argv) {
     if (request_deadline_ms < 100 || request_deadline_ms > 60000)
         throw std::runtime_error("request deadline must be between 100 and 60000 ms");
     const auto request_deadline = std::chrono::milliseconds(request_deadline_ms);
+    const int handshake_deadline_ms = std::stoi(arg(argc, argv, "--handshake-deadline-ms", "10000"));
+    if (handshake_deadline_ms < 100 || handshake_deadline_ms > 60000)
+        throw std::runtime_error("TLS handshake deadline must be between 100 and 60000 ms");
+    const auto handshake_deadline = std::chrono::milliseconds(handshake_deadline_ms);
     std::set<std::string> agents = read_allowlist(agents_file);
     std::set<std::string> operators = read_allowlist(operators_file);
     if (tenant.empty() || tenant.size() > 128U) throw std::runtime_error("--tenant must be configured");
@@ -721,8 +778,8 @@ int run_server(int argc, char **argv) {
     sigemptyset(&action.sa_mask);
     (void)sigaction(SIGINT, &action, nullptr);
     (void)sigaction(SIGTERM, &action, nullptr);
-    std::cout << "sw-server listening on 127.0.0.1:" << port << " (mTLS, lab only; request deadline "
-              << request_deadline_ms << " ms)\n";
+    std::cout << "sw-server listening on 127.0.0.1:" << port << " (mTLS, lab only; TLS handshake deadline "
+              << handshake_deadline_ms << " ms; HTTP request deadline " << request_deadline_ms << " ms)\n";
     while (!stopping) {
         sockaddr_storage peer {};
         socklen_t peer_len = sizeof(peer);
@@ -732,7 +789,8 @@ int run_server(int argc, char **argv) {
             continue;
         }
         if (fd < 0) break;
-        serve_one(db, agents, operators, admin_token, tenant, policy_key.get(), ctx, fd, request_deadline);
+        serve_one(db, agents, operators, admin_token, tenant, policy_key.get(), ctx, fd,
+            request_deadline, handshake_deadline);
     }
     close(listener); sqlite3_close(db); SSL_CTX_free(ctx);
     return 0;

@@ -20,11 +20,22 @@ printf '%s\n' 'smoke-admin-token-0123456789-abcdefghijklmnopqrstuvwxyz' >"$tmp/a
 chmod 600 "$tmp/admin-token"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 
+for invalid_handshake_deadline in 99 60001; do
+    if "$bin_dir/sw-server" run --handshake-deadline-ms "$invalid_handshake_deadline" \
+        >"$tmp/invalid-handshake-deadline-$invalid_handshake_deadline.log" 2>&1; then
+        echo "server accepted invalid TLS handshake deadline $invalid_handshake_deadline" >&2
+        exit 1
+    fi
+    grep -q 'TLS handshake deadline must be between 100 and 60000 ms' \
+        "$tmp/invalid-handshake-deadline-$invalid_handshake_deadline.log"
+done
+
 "$bin_dir/sw-server" run --bind 127.0.0.1 --port "$port" \
     --cert "$certs/server.crt" --key "$certs/server.key" --ca "$certs/ca.crt" \
     --agents "$certs/agents.txt" --operators "$certs/operators.txt" \
     --admin-token-file "$tmp/admin-token" --policy-key "$certs/policy-signing.key" \
-    --tenant smoke-tenant --request-deadline-ms 1500 --db "$tmp/server.sqlite" >"$tmp/server.log" 2>&1 &
+    --tenant smoke-tenant --handshake-deadline-ms 1000 --request-deadline-ms 1500 \
+    --db "$tmp/server.sqlite" >"$tmp/server.log" 2>&1 &
 server_pid=$!
 python3 - "$certs" "$port" <<'PY'
 import socket, ssl, sys, time
@@ -47,6 +58,36 @@ for _ in range(100):
 else:
     raise SystemExit("mTLS health check did not become ready: " + str(last))
 PY
+
+python3 - "$port" <<'PY'
+import select, socket, sys, time
+port = int(sys.argv[1])
+sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+sock.settimeout(0.1)
+start = time.monotonic()
+sock.sendall(b"\x16\x03\x01\x00\x10\x01\x00\x10\x00\x03\x03" + b"\x00" * 10)
+closed = False
+while time.monotonic() - start < 3.0:
+    ready, _, _ = select.select([sock], [], [], 0)
+    if ready:
+        try:
+            if not sock.recv(4096):
+                closed = True
+                break
+        except OSError:
+            closed = True
+            break
+    try:
+        sock.sendall(b"\x16\x03\x01\x00\x01\x00")
+    except OSError:
+        closed = True
+        break
+    time.sleep(0.04)
+elapsed = time.monotonic() - start
+sock.close()
+assert closed and 0.7 <= elapsed < 2.5, (closed, elapsed)
+PY
+grep -q 'TLS handshake absolute deadline exceeded' "$tmp/server.log"
 
 python3 - "$certs" "$port" <<'PY'
 import select, socket, ssl, sys, time

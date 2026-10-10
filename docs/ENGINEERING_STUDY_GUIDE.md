@@ -4,7 +4,7 @@
 
 이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구, no-policy 차단, telemetry 비활성 큐 보존, sample rate 적용을 확인합니다. 추가로 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부합니다. 1.5초로 설정한 HTTP 요청 절대 deadline 아래 slow-client가 종료되는 것도 통합 시험에서 확인합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. TLS handshake에는 아직 전체 수명 deadline이 없습니다. 전체 SRS는 부분 구현 상태입니다. `telemetry_enabled`와 `sample_rate`는 합성 telemetry 경로에 적용되지만 `monitored_roots` 실제 파일 감시, production enrollment/revocation/RBAC, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구, no-policy 차단, telemetry 비활성 큐 보존, sample rate 적용을 확인합니다. 추가로 allowlist 밖으로 정규화되는 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision을 거부합니다. 1초 TLS handshake deadline 아래 불완전 ClientHello trickle과 1.5초 HTTP request deadline 아래 slow-client 종료도 각각 통합 시험에서 확인합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. `telemetry_enabled`와 `sample_rate`는 합성 telemetry 경로에 적용되지만 `monitored_roots` 실제 파일 감시, production enrollment/revocation/RBAC, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
@@ -15,7 +15,7 @@ GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 �
 | TLS client | 서버 인증서와 SAN을 검증하고 client 인증서를 제시합니다. | `client_context`, `connect_socket`, `send_batch` |
 | ACK와 재시도 | 모호한 응답이나 전송 실패 뒤에도 데이터를 잃지 않게 합니다. | `ack_ids`, `flush` |
 | Runtime policy gate | 서명 정책을 읽어 합성 이벤트 생성과 저장 큐 전송을 fail-closed 방식으로 제어합니다. | `active_policy`, `enqueue_synthetic_if_enabled`, `flush` |
-| TLS reference server | mTLS client와 allowlist를 확인하고 제한된 요청을 받습니다. | `run_server`, `serve_one`, `read_request` |
+| TLS reference server | 절대 handshake deadline으로 느린 TLS peer가 순차 서버를 점유하는 시간을 제한하고, mTLS client와 allowlist를 확인합니다. | `run_server`, `accept_tls_with_deadline`, `serve_one`, `read_request` |
 | HTTP framing 경계 | 바이트 스트림에서 하나의 요청·응답 경계를 모호하지 않게 정하고 자원 사용을 제한합니다. | Agent `http_exchange`, `server/include/agent/http.hpp`의 `parse_request_head`·`parse_request`, TLS adapter `read_request` |
 | 제한된 JSON 파서 | 숫자 문법, 중복 키, 깊이와 입력 크기를 검증합니다. | `agent/include/agent/json.hpp`, `server/include/agent/json.hpp` |
 | 멱등 ingestion | 같은 이벤트 재전송은 구분해 승인하고, 같은 ID의 다른 내용은 거부합니다. | `ingest`, SQLite 고유 키 |
@@ -37,7 +37,7 @@ GCC와 Clang 21.1.8 Release 및 ASan/UBSan 빌드, 각 CTest 4/4, Clang 정적 �
 ### Server 수신과 ingestion
 
 1. `run_server`는 loopback 이외의 bind를 거부하고, IPv4 loopback listener와 TLS 인증서를 준비합니다.
-2. `accept4(..., SOCK_CLOEXEC)`로 연결을 받고 `serve_one`이 mTLS handshake, CA chain, client 인증서 CN과 allowlist를 확인합니다. 이 구현은 연결을 한 번에 하나씩 처리합니다.
+2. `accept4(..., SOCK_CLOEXEC)`로 연결을 받고 `serve_one`은 accepted socket을 nonblocking으로 전환해 `SSL_accept`를 진행합니다. `SSL_get_error`가 `WANT_READ`/`WANT_WRITE`를 반환하면 남은 절대 deadline 동안 `poll`하고 같은 handshake를 재시도합니다. 기본 TLS handshake deadline은 10초이며 `--handshake-deadline-ms`로 100–60,000 ms 범위에서 설정합니다. 완료되면 원래 blocking flag를 복구한 뒤 CA chain, client 인증서 CN과 allowlist를 확인합니다. 이 구현은 연결을 한 번에 하나씩 처리합니다.
 3. `read_request`는 TLS에서 읽은 byte 조각을 `raw` 문자열에 모읍니다. transport-independent `parse_request_head`는 header 끝을 찾고 header·body 경계를 검사해, header가 아직 불완전하면 `nullopt`를 반환합니다. `parse_request`는 선언 길이와 실제 길이가 정확히 일치할 때만 소유형 `Request`를 반환합니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. accepted socket의 개별 I/O timeout은 5초이며, TLS handshake가 끝난 뒤 시작하는 전체 HTTP request deadline은 기본 10초이고 `--request-deadline-ms`로 100–60,000 ms 범위에서 설정할 수 있습니다.
 4. `serve_one`은 `/v1/admin/policies`에서 operator CN allowlist와 mode-0600 token을 모두 확인하고 새 JSON 정책을 제한된 schema로 검증한 뒤 Ed25519 서명과 monotonic tenant revision을 SQLite에 저장합니다. 같은 revision과 정확히 같은 문서의 재게시만 200 idempotent 응답이며, 새 정책은 201입니다. Agent policy GET은 서명 envelope를 200으로 주고 SHA-256 ETag가 일치하면 304로 본문 전송을 생략합니다. health, status, telemetry, heartbeat 경로도 역할별로 분기합니다. `ingest`는 JSON schema, 주장된 agent ID, 인증서 identity, 이벤트 수, 민감 키, payload hash를 확인합니다.
 5. 서버는 `(agent_id,event_id)` 고유 키로 transaction에 기록하고 commit한 뒤에만 ACK를 보냅니다. 동일 sequence/hash의 재수신은 duplicate, 내용이 바뀐 ID 재사용은 오류가 됩니다.
@@ -49,7 +49,7 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 ## Linux 인터페이스와 자원 수명
 
 - TCP 경로는 `getaddrinfo(3)`, `socket(2)`, `setsockopt(2)`, `connect(2)`, 서버의 `bind(2)`, `listen(2)`, `accept4(2)`, 마지막 `close(2)`를 사용합니다. TCP는 메시지 경계가 없는 byte stream이므로 HTTP framing이 필요합니다.
-- `SOCK_CLOEXEC`은 실행 파일을 새 프로세스로 바꿀 때 FD 누출을 줄입니다. `SO_RCVTIMEO`/`SO_SNDTIMEO`는 개별 block I/O 대기를 제한합니다. Server는 HTTP request read에 단조 시계 기반 절대 deadline도 적용하지만 그 시점은 TLS handshake 뒤입니다. 따라서 handshake 전체 deadline, 동시성 한도, 서비스 rate limit은 제공하지 않습니다.
+- `SOCK_CLOEXEC`은 실행 파일을 새 프로세스로 바꿀 때 FD 누출을 줄입니다. `SO_RCVTIMEO`/`SO_SNDTIMEO`는 개별 block I/O 대기를 제한합니다. TLS handshake는 별도 nonblocking `SSL_accept` loop에서 `poll`과 `std::chrono::steady_clock` deadline을 사용합니다. HTTP request read에는 TLS/CN 확인 뒤 시작하는 별도 절대 deadline이 있습니다. 이 두 기한은 route 처리, 동시성 한도, 서비스 rate limit을 제한하지 않습니다.
 - `SSL_CTX`는 TLS 설정과 신뢰 정보를 보유하고 여러 `SSL` 세션의 기반이 됩니다. `SSL*`는 socket FD에 연결되어 handshake와 record I/O를 수행합니다. Agent와 Server의 `SSL*`는 `unique_ptr`, 양쪽 connected FD는 `ScopedFd`가 관리합니다. SQLite DB와 statement는 수동 정리 분기가 있어 예외 경로를 함께 추적해야 합니다.
 - C++ `std::string`, vector, map, parser `Value`는 자신이 소유한 메모리를 관리합니다. SQLite row를 읽을 때 statement가 유효한 동안 값을 복사해야 합니다. `active_policy`는 issuer·document bytes를 복사해 둔 뒤 `sqlite3_finalize`합니다. `sqlite3_stmt*`는 finalize 전까지 DB 자원을 점유합니다. CLI의 DB handle은 `unique_ptr` deleter로 command 예외 경로에서도 닫힙니다.
 - HTTP parser의 내부 `std::string_view`는 입력 `raw`가 살아 있는 동안만 사용하고, 반환 전에 method/path/body/content-type을 `std::string`으로 복사합니다. 따라서 호출자는 TLS 수신 buffer를 덮어써도 `Request`가 dangling view를 갖지 않습니다. fuzz harness도 입력을 view로 전달하고 parser 반환 뒤에 어떤 입력 포인터도 보관하지 않습니다.
@@ -79,8 +79,8 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 
 ## 공식 문서
 
-- Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`connect(2)`](https://man7.org/linux/man-pages/man2/connect.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html)
-- OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
+- Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`connect(2)`](https://man7.org/linux/man-pages/man2/connect.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html)
+- OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_accept`](https://docs.openssl.org/3.0/man3/SSL_accept/), [`SSL_get_error`](https://docs.openssl.org/3.0/man3/SSL_get_error/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
 - OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
 - SQLite: [WAL](https://www.sqlite.org/wal.html), [Atomic Commit](https://www.sqlite.org/atomiccommit.html)
 - IETF: [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110), [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)

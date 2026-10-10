@@ -77,3 +77,5 @@ Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변
 56. `--request-deadline-ms`의 허용 범위가 100–60,000 ms인 이유를 설계 관점에서 설명하고, 값이 최소·최대 경계를 벗어날 때 server가 어떻게 동작하는지 검증하려면 어떤 CLI 시험을 추가하겠습니까?
 
 57. `sample_rate=0`일 때 기존 queue를 flush하면서 새 event는 만들지 않는 이유를 코드로 증명하세요. 0과 1 사이의 표본은 어떤 난수 입력과 정수 범위에서 만들어지며, `RAND_bytes` 실패 시 어떤 안전한 동작을 해야 하나요?
+
+58. `accept_tls_with_deadline`에서 nonblocking `SSL_accept`가 `SSL_ERROR_WANT_READ`와 `SSL_ERROR_WANT_WRITE`를 반환할 때 각각 어떤 poll event를 기다리나요? 매 반복에서 deadline 잔여 시간을 다시 계산하고 원래 FD flag를 복구해야 하는 이유를 설명하세요.
