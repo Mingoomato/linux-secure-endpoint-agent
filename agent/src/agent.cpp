@@ -102,6 +102,13 @@ bool is_loopback(const std::string &host) {
     in6_addr v6 {};
     return inet_pton(AF_INET6, host.c_str(), &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6);
 }
+bool path_is_within(const std::filesystem::path &candidate, const std::filesystem::path &root) {
+    auto candidate_part = candidate.begin();
+    for (auto root_part = root.begin(); root_part != root.end(); ++root_part, ++candidate_part) {
+        if (candidate_part == candidate.end() || *candidate_part != *root_part) return false;
+    }
+    return true;
+}
 void sql_check(int rc, sqlite3 *db, const char *where) {
     if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW)
         throw std::runtime_error(std::string(where) + ": " + sqlite3_errmsg(db));
@@ -525,11 +532,19 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
         throw std::runtime_error("SEA_SCOPE_INVALID: issuer, tenant scope, or revision invalid");
     std::string expires = root.get("expires_at") ? root.get("expires_at")->string_or() : "";
     std::tm tm {};
-    if (std::sscanf(expires.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d",
-        &tm.tm_year,&tm.tm_mon,&tm.tm_mday,&tm.tm_hour,&tm.tm_min,&tm.tm_sec) != 6)
+    if (expires.size() != 20U || expires.back() != 'Z' ||
+        strptime(expires.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tm) != expires.c_str() + expires.size())
         throw std::runtime_error("policy expires_at invalid");
-    tm.tm_year -= 1900; tm.tm_mon -= 1;
-    if (timegm(&tm) <= std::time(nullptr)) throw std::runtime_error("SEA_POLICY_EXPIRED");
+    const std::tm requested_time = tm;
+    const std::time_t expiry_epoch = timegm(&tm);
+    std::tm normalized_time {};
+    if (expiry_epoch == static_cast<std::time_t>(-1) ||
+        gmtime_r(&expiry_epoch, &normalized_time) == nullptr ||
+        normalized_time.tm_year != requested_time.tm_year || normalized_time.tm_mon != requested_time.tm_mon ||
+        normalized_time.tm_mday != requested_time.tm_mday || normalized_time.tm_hour != requested_time.tm_hour ||
+        normalized_time.tm_min != requested_time.tm_min || normalized_time.tm_sec != requested_time.tm_sec)
+        throw std::runtime_error("policy expires_at invalid");
+    if (expiry_epoch <= std::time(nullptr)) throw std::runtime_error("SEA_POLICY_EXPIRED");
     const Value *actions_v = root.get("allowed_actions");
     const auto *actions = actions_v ? std::get_if<Array>(&actions_v->data) : nullptr;
     if (!actions) throw std::runtime_error("allowed_actions must be an array");
@@ -541,6 +556,13 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
     const Value *settings = root.get("settings");
     const auto *setting_obj = settings ? std::get_if<agent::json::Object>(&settings->data) : nullptr;
     if (!setting_obj) throw std::runtime_error("settings must be an object");
+    const std::filesystem::path configured_root(allowed_root);
+    std::error_code path_error;
+    if (!configured_root.is_absolute())
+        throw std::runtime_error("policy root outside configured allowlist");
+    const auto canonical_root = std::filesystem::canonical(configured_root, path_error);
+    if (path_error || !std::filesystem::is_directory(canonical_root, path_error) || path_error)
+        throw std::runtime_error("configured policy root must be an existing directory");
     for (const auto &[name, value] : *setting_obj) {
         if (name == "telemetry_enabled") {
             if (!std::get_if<bool>(&value.data)) throw std::runtime_error("telemetry_enabled must be boolean");
@@ -551,10 +573,13 @@ void validate_signed_policy(const Config &c, const std::string &file, const std:
             const auto *roots = std::get_if<Array>(&value.data);
             if (!roots) throw std::runtime_error("monitored_roots must be an array");
             for (const auto &r : *roots) {
-                std::string path = r.string_or();
-                if (path.empty() || path[0] != '/' ||
-                    !(path == allowed_root || (path.size() > allowed_root.size() &&
-                      path.compare(0, allowed_root.size(), allowed_root) == 0 && path[allowed_root.size()] == '/')))
+                const std::filesystem::path path(r.string_or());
+                if (!path.is_absolute())
+                    throw std::runtime_error("policy root outside configured allowlist");
+                path_error.clear();
+                const auto canonical_path = std::filesystem::canonical(path, path_error);
+                if (path_error || !std::filesystem::is_directory(canonical_path, path_error) || path_error ||
+                    !path_is_within(canonical_path, canonical_root))
                     throw std::runtime_error("policy root outside configured allowlist");
             }
         } else throw std::runtime_error("policy setting rejected: " + name);

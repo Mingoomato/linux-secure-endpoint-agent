@@ -4,7 +4,7 @@
 
 이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, ASan/UBSan CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 분리한 HTTP request parser는 seed 입력을 이용한 Clang libFuzzer+ASan+UBSan 50,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, GCC와 Clang ASan/UBSan CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 정책 시험은 allowlist 밖으로 정규화되는 `..` 경로, 외부를 가리키는 심볼릭 링크, 달력상 유효하지 않은 만료일을 거부합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
@@ -42,7 +42,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, ASan/UBSan CTest 4/4, Clang �
 
 ### 서명 정책 경로
 
-`validate_signed_policy`는 파일 크기를 제한해 정책과 서명을 읽고, JSON 파싱 전에 원본 바이트에 대한 64-byte Ed25519 detached signature를 검증합니다. 허용 필드·action, 만료, tenant/root scope를 확인하고 이전 revision보다 큰 값만 transaction으로 last-good DB 상태에 저장합니다. 이 프로젝트에는 저장된 정책을 적용하는 runtime watcher나 enforcement hook이 없습니다. 정책 저장 성공을 정책 적용 성공으로 해석하면 안 됩니다.
+`validate_signed_policy`는 파일 크기를 제한해 정책과 서명을 읽고, JSON 파싱 전에 원본 바이트에 대한 64-byte Ed25519 detached signature를 검증합니다. UTC 만료 문자열을 고정 형식과 달력 날짜로 검증하고 허용 필드·action, tenant/root scope를 확인합니다. root 범위는 경로 문자열 접두사가 아니라 기존 디렉터리를 canonicalize한 뒤 구성 요소 단위로 비교하므로 `..` 정규화와 외부 symlink를 통한 이탈을 거부합니다. 이전 revision보다 큰 값만 transaction으로 last-good DB 상태에 저장합니다. 저장된 정책을 적용하는 runtime watcher나 enforcement hook은 없습니다. 저장 성공을 정책 적용 성공으로 해석하면 안 되며, 향후 적용 시점의 파일시스템 변경 경쟁은 별도 해결해야 합니다.
 
 ## Linux 인터페이스와 자원 수명
 

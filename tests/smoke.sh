@@ -167,6 +167,35 @@ EOF
 openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$tmp/policy.json" -out "$tmp/policy.sig"
 "$bin_dir/sw-agentd" validate-policy --store "$tmp/policy-store" --file "$tmp/policy.json" \
     --signature "$tmp/policy.sig" --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant --root "$tmp/allowed-root" >"$tmp/policy-ok.json"
+
+mkdir "$tmp/allowed-root/nested" "$tmp/outside-root"
+ln -s "$tmp/outside-root" "$tmp/allowed-root/external-link"
+expect_policy_rejected() {
+    label=$1
+    monitored_root=$2
+    expiry=$3
+    expected=$4
+    policy_file="$tmp/policy-$label.json"
+    signature_file="$tmp/policy-$label.sig"
+    cat >"$policy_file" <<EOF
+{"schema_version":"policy.v1","policy_id":"smoke-policy-$label","revision":1,"issuer":"smoke-issuer","issued_at":"2026-10-10T00:00:00Z","expires_at":"$expiry","tenant_scope":"smoke-tenant","allowed_actions":["telemetry.configure","monitor.roots.configure"],"settings":{"telemetry_enabled":true,"sample_rate":1,"monitored_roots":["$monitored_root"]}}
+EOF
+    openssl pkeyutl -sign -rawin -inkey "$certs/policy-signing.key" -in "$policy_file" -out "$signature_file"
+    if "$bin_dir/sw-agentd" validate-policy --store "$tmp/policy-store-$label" --file "$policy_file" \
+        --signature "$signature_file" --pubkey "$certs/policy-signing.pub" --tenant smoke-tenant \
+        --root "$tmp/allowed-root" >"$tmp/policy-$label.out" 2>&1; then
+        echo "policy validation unexpectedly accepted $label" >&2
+        exit 1
+    fi
+    grep -q "$expected" "$tmp/policy-$label.out"
+}
+expect_policy_rejected traversal "$tmp/allowed-root/../outside-root" 2099-01-01T00:00:00Z \
+    'policy root outside configured allowlist'
+expect_policy_rejected symlink "$tmp/allowed-root/external-link" 2099-01-01T00:00:00Z \
+    'policy root outside configured allowlist'
+expect_policy_rejected invalid-date "$tmp/allowed-root/nested" 2099-02-30T00:00:00Z \
+    'policy expires_at invalid'
+
 cp "$tmp/policy.json" "$tmp/policy-tampered.json"
 printf ' ' >>"$tmp/policy-tampered.json"
 set +e

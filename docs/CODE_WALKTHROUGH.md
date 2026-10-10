@@ -28,7 +28,7 @@ HTTP 문법은 `server/include/agent/http.hpp`에 있는 순수 함수로 분리
 
 ## 4. Policy 검증과 저장
 
-CLI의 `validate-policy` 경로는 `read_limited`로 크기가 제한된 파일을 읽고 `validate_signed_policy`를 호출합니다. 이 함수는 JSON 해석 전에 원본 파일 bytes의 Ed25519 signature를 검증합니다. 이후 허용 필드, action, expiry, tenant 및 monitored root 범위, revision을 확인합니다. 유효한 새 revision만 DB transaction으로 last-good 상태에 저장합니다. server의 policy GET 경로는 현재 변경 없는 응답을 주며 실제 배포·적용 기능은 구현되지 않았습니다.
+CLI의 `validate-policy` 경로는 `read_limited`로 크기가 제한된 파일을 읽고 `validate_signed_policy`를 호출합니다. 이 함수는 JSON 해석 전에 원본 파일 bytes의 Ed25519 signature를 검증합니다. 이후 허용 필드, action, 엄격한 UTC expiry, tenant 및 monitored root 범위, revision을 확인합니다. 경로는 기존 디렉터리로 canonicalize한 뒤 구성 요소 단위로 비교하므로 `..`와 외부 symlink를 통한 우회가 거부됩니다. 유효한 새 revision만 DB transaction으로 last-good 상태에 저장합니다. server의 policy GET 경로는 현재 변경 없는 응답을 주며 실제 배포·적용 기능은 구현되지 않았습니다.
 
 ## 5. 예외와 소유권 추적
 
@@ -38,6 +38,6 @@ Agent와 Server의 `SSL_CTX`/`SSL*`는 `unique_ptr`를 사용하며 연결 socke
 
 ## 6. 회귀 테스트
 
-`tests/smoke.sh`는 임시 디렉터리에서 로컬 CA를 만들고 loopback mTLS 연결, event ACK, deduplication, 충돌 ID 거부, allowlist 거부, 정책 signature/tamper/replay를 확인합니다. HTTP 음성 사례는 duplicate Content-Length, Transfer-Encoding, 잘못된/초과 길이, 누락 길이, HTTP/1.0, GET body, 중복 Host, 초과 header와 incomplete body timeout을 검사합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
+`tests/smoke.sh`는 임시 디렉터리에서 로컬 CA를 만들고 loopback mTLS 연결, event ACK, deduplication, 충돌 ID 거부, allowlist 거부, 정책 signature/tamper/replay를 확인합니다. 정책 회귀 사례는 허용 루트 외부를 가리키는 `..`와 symlink, 달력상 존재하지 않는 날짜를 거부하는지 검사합니다. HTTP 음성 사례는 duplicate Content-Length, Transfer-Encoding, 잘못된/초과 길이, 누락 길이, HTTP/1.0, GET body, 중복 Host, 초과 header와 incomplete body timeout을 검사합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
 
 `tests/json_parser_test.cpp`는 같은 테스트를 Agent와 Server의 JSON parser 사본 각각에 컴파일합니다. `tests/http_parser_test.cpp`는 순수 HTTP parser의 정상·거부 경계와 크기 상한을 socket 없이 확인합니다. `tests/http_parser_fuzz.cpp`는 `-DSEA_BUILD_HTTP_FUZZER=ON`으로 별도 빌드하며, `tests/http_fuzz_corpus` seed로 libFuzzer 입력을 변형합니다. 이 구조는 두 JSON parser 사본의 drift를 줄이는 회귀 장치이지, 두 구현이 같음을 증명하거나 Unicode 전체를 처리한다는 뜻은 아닙니다. HTTP fuzz 입력은 짧은 개발 실행을 통과했지만 장기 fuzz campaign은 별도 검증입니다.

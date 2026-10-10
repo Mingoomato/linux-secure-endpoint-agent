@@ -12,7 +12,7 @@
 6. `ingest` transaction은 언제 commit되고, 어떤 시점 이후에 ACK가 전송되나요?
 7. Agent는 server 응답의 ID를 어떤 제출 batch와 비교한 뒤 queue에서 제거하나요?
 8. event payload hash가 계산되는 값과 server가 다시 계산하는 값은 무엇인가요?
-9. `validate_signed_policy`는 raw bytes 검증, JSON 검사, scope/expiry 확인, DB 변경을 어떤 순서로 수행하나요?
+9. `validate_signed_policy`는 raw bytes 검증, JSON 검사, UTC expiry 확인, canonical root scope 확인, DB 변경을 어떤 순서로 수행하나요?
 
 ## Linux·메모리·실패 분석
 
@@ -44,6 +44,13 @@
 29. 현재 GCC/Clang·sanitizer·정적 분석·음성 framing 결과만으로 알 수 없는 SRS 항목은 무엇인가요?
 30. 이 저장소의 테스트 통과가 소유자의 개인 숙련도를 증명하지 않는 이유는 무엇이며, 독립 재현의 증거는 어떤 형태여야 하나요?
 31. `parse_request_head` 안의 `string_view`가 입력 buffer보다 오래 살아남지 않도록 하는 소유권 경계는 무엇인가요? 반환 `Request`는 어떤 필드를 복사하나요?
-32. 50,000회 libFuzzer 실행이 parser 안전성에 제공하는 근거와, 전체 RFC 적합성·장기 안정성에 대해 말해 주지 못하는 점을 구분하세요.
+32. 100,000회 libFuzzer 실행이 parser 안전성에 제공하는 근거와, 전체 RFC 적합성·장기 안정성에 대해 말해 주지 못하는 점을 구분하세요.
+33. allowlist 경로에서 문자열 prefix 비교가 `..`와 symlink에 취약한 이유는 무엇이며, 현재 구현은 어떤 경로 비교를 하나요?
+34. policy의 `expires_at`에 달력상 존재하지 않는 날짜나 trailing text를 넣으면 어떤 단계에서 거부되어야 하나요? 실패한 시험은 `policy_state`에 어떤 영향을 줘야 하나요?
+35. canonical path 검사를 마친 뒤 실제 runtime monitor가 그 경로를 열기까지 남는 TOCTOU 위험은 무엇이며, 어떤 Linux 인터페이스로 줄일 수 있나요?
+36. `SO_RCVTIMEO`가 각 read를 제한해도 느린 peer가 전체 request 수명을 늘릴 수 있는 이유는 무엇인가요? 절대 deadline은 어떤 시계로 계산해야 하나요?
+37. ACK에 제출하지 않은 event ID가 포함되면 DB delete가 어떤 기준으로 제한되며, 왜 server response를 그대로 신뢰하면 안 되나요?
+38. 만료 정책을 거부하는 것과 이전 revision을 유지하는 것은 서로 어떤 별개의 불변 조건인가요?
+39. 이 저장소의 `enroll` 또는 `doctor` 응답이 실제 server-side enrollment를 증명하는지 코드에서 어떻게 판별하나요?
 
 Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변을 관찰한 뒤에만 평가합니다. 현재 소유자 학습·재현 상태는 **관찰되지 않음**입니다.

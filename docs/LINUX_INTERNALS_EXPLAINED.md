@@ -24,7 +24,7 @@ Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subs
 
 `SSL_read`는 TLS application bytes를 돌려주며 한 호출이 한 HTTP 요청과 대응하지 않습니다. `read_request`가 이를 `std::string`에 누적하고, `parse_request_head`가 CRLF delimiter를 찾은 뒤 Content-Length와 제한을 검사합니다. head가 끝나지 않은 상태는 `nullopt`로 표현되어 더 읽을 수 있고, 완성된 `Request`에는 입력 `string_view`를 남기지 않고 소유형 문자열을 복사합니다. 따라서 view는 parser 호출 안에서만 유효하고, 이후 TLS buffer 재사용과 분리됩니다.
 
-`tests/http_parser_test.cpp`는 TLS 연결 없이 경계 조건을 회귀 검사합니다. 선택형 libFuzzer harness는 parser에 임의 바이트를 직접 전달하고, malformed request의 예외는 정상적인 입력 거부로 취급합니다. Clang libFuzzer+ASan+UBSan 50,000회 개발 실행은 실패 없이 완료되었지만, 이는 특정 seed와 짧은 실행의 결과입니다. 전체 RFC 문법, 장시간 안정성, server concurrency나 TLS 상태 전이를 보증하지 않습니다.
+`tests/http_parser_test.cpp`는 TLS 연결 없이 경계 조건을 회귀 검사합니다. 선택형 libFuzzer harness는 parser에 임의 바이트를 직접 전달하고, malformed request의 예외는 정상적인 입력 거부로 취급합니다. Clang libFuzzer+ASan+UBSan 100,000회 개발 실행은 실패 없이 완료되었지만, 이는 특정 seed와 짧은 실행의 결과입니다. 전체 RFC 문법, 장시간 안정성, server concurrency나 TLS 상태 전이를 보증하지 않습니다.
 
 ## SQLite transaction과 ACK 의미
 
@@ -38,6 +38,12 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 각 프로그램의 parser는 JSON 숫자 문법, JSON 공백 네 종류, duplicate object key 거부, 깊이 32, 입력 1 MiB 제한을 적용합니다. 숫자는 grammar를 먼저 확인하고 `std::from_chars`로 변환합니다. agent/server 헤더가 복제되어 있으므로 같은 테스트를 양쪽에 각각 빌드합니다. Unicode surrogate pair 등 완전한 Unicode 처리가 필요한 범용 parser라고 주장하지 않습니다.
 
+## 정책 경로 정규화와 심볼릭 링크
+
+정책의 monitored root를 사용자 입력 문자열의 접두사 비교만으로 제한하면 안 됩니다. `..` 구성 요소는 allowlist prefix가 문자열에 남아 있어도 다른 디렉터리를 가리킬 수 있고, 심볼릭 링크는 겉으로 보이는 위치와 실제 대상을 분리합니다. Agent는 설정된 허용 디렉터리와 각 요청 경로를 `std::filesystem::canonical`로 정규화해 기존 디렉터리 여부를 확인한 다음 경로 구성 요소를 비교합니다. `/safe/root2`는 `/safe/root`의 하위 경로가 아니므로 텍스트 prefix가 아니라 component 경계가 중요합니다.
+
+이 검사는 정책 문서를 저장하기 전의 경로 유효성 검사입니다. 현재 runtime watcher가 없어 파일을 실제로 열지는 않습니다. 미래에 감시를 시작하면서 같은 경로를 다시 사용할 경우 검사와 사용 사이에 symlink가 바뀌는 TOCTOU 경쟁이 남을 수 있으므로, 디렉터리 FD 기반 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해야 합니다.
+
 ## systemd와 프로세스 경계
 
 예제 unit은 전용 사용자, `NoNewPrivileges`, 제한된 파일시스템 view, private temporary directory, 명시 writable 경로를 보여줍니다. 실제 설치·사용자 생성·key provisioning·uninstall은 구현되지 않았습니다. service sandbox는 TLS와 애플리케이션 인증 대신 사용할 수 없습니다.
@@ -45,6 +51,7 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 ## 공식 문서
 
 - Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`setsockopt(2)`](https://man7.org/linux/man-pages/man2/setsockopt.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html), [`close(2)`](https://man7.org/linux/man-pages/man2/close.2.html)
+- Linux path resolution: [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`realpath(3)`](https://man7.org/linux/man-pages/man3/realpath.3.html)
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
 - IETF: [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)
 - LLVM: [libFuzzer documentation](https://llvm.org/docs/LibFuzzer.html)
