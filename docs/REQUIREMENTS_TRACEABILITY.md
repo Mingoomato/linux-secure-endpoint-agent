@@ -1,6 +1,6 @@
 # Requirements traceability (SRS-06)
 
-The recorded loopback integration and parser tests verify selected mTLS, queue, deduplication, policy-signature, and strict JSON parsing paths. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
+The recorded loopback integration and parser tests verify selected mTLS, queue, deduplication, policy-signature, strict JSON, and bounded HTTP request parsing paths. A seeded 50,000-run libFuzzer campaign is limited parser evidence, not full protocol or SRS verification. See `docs/TEST_RESULTS.md`; remaining SRS requirements are not implied by these tests.
 
 | Requirement | Source / artifact | Verification | Status |
 |---|---|---|---|
@@ -19,7 +19,7 @@ The recorded loopback integration and parser tests verify selected mTLS, queue, 
 | SEA-FR-013 | Ed25519 detached signature + scope/expiry | tests/smoke.sh (signature tamper/replay) | IN_PROGRESS |
 | SEA-FR-014 | monotonic revision and last-good DB | SEA-T-009 pending | IN_PROGRESS |
 | SEA-FR-015 | validate then transactional last-good swap | SEA-T-011 pending | IN_PROGRESS |
-| SEA-FR-016 | registry, telemetry, heartbeat, status, health routes; bounded HTTP/1.1 framing and JSON media type | `tests/smoke.sh` route subset + framing/content-type rejection and non-200 ACK retention | IN_PROGRESS |
+| SEA-FR-016 | registry, telemetry, heartbeat, status, health routes; bounded HTTP/1.1 framing and JSON media type | `tests/smoke.sh`, `tests/http_parser_test.cpp`, and 50,000-run `tests/http_parser_fuzz.cpp`; route/framing matrix remains partial | IN_PROGRESS |
 | SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection and strict JSON parsing | parser CTests; SEA-T-012 privacy tests pending | IN_PROGRESS |
 | SEA-FR-018 | systemd units, PID stop, service controls | SEA-T-014 pending | IN_PROGRESS |
 | SEA-FR-019 | logs omit key/token/payload values | source review pending | IN_PROGRESS |

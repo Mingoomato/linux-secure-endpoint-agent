@@ -1,4 +1,5 @@
 #include "agent/json.hpp"
+#include "agent/http.hpp"
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -24,6 +25,7 @@
 #include <iomanip>
 #include <locale>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -33,6 +35,7 @@
 namespace {
 using agent::json::Value;
 using agent::json::Array;
+using agent::http::Request;
 volatile sig_atomic_t stopping = 0;
 void stop_signal(int sig) { (void)sig; stopping = 1; }
 
@@ -117,130 +120,22 @@ bool contains_sensitive_key(const Value &v, unsigned depth=0) {
     return false;
 }
 
-constexpr std::size_t kMaxHttpHeader = 16U * 1024U;
-constexpr std::size_t kMaxHttpBody = 1024U * 1024U;
-
-bool http_token_char(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-        c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' ||
-        c == '+' || c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
-}
-std::string lowercase_ascii(std::string value) {
-    for (char &c : value) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    return value;
-}
-std::size_t parse_content_length(const std::string &value) {
-    if (value.empty()) throw std::runtime_error("empty Content-Length");
-    std::size_t length = 0;
-    for (unsigned char c : value) {
-        if (c < '0' || c > '9') throw std::runtime_error("invalid Content-Length");
-        std::size_t digit = static_cast<std::size_t>(c - '0');
-        if (length > (kMaxHttpBody - digit) / 10U) throw std::runtime_error("request body too large");
-        length = length * 10U + digit;
-    }
-    return length;
-}
-std::string trim_http_value(std::string value) {
-    std::size_t first = value.find_first_not_of(" \t");
-    if (first == std::string::npos) return {};
-    std::size_t last = value.find_last_not_of(" \t");
-    return value.substr(first, last - first + 1U);
-}
-
-struct Request { std::string method, path, body, content_type; };
-Request read_request(SSL *ssl) {
+agent::http::Request read_request(SSL *ssl) {
     std::string raw;
     std::array<char, 8192> buffer {};
-    std::size_t header_end = std::string::npos;
-    std::size_t body_length = 0;
-    bool got_headers = false;
-    Request req;
     for (;;) {
-        if (raw.size() > kMaxHttpHeader + 4U + kMaxHttpBody)
+        if (raw.size() > agent::http::kMaxHttpHeader + 4U + agent::http::kMaxHttpBody)
             throw std::runtime_error("HTTP request exceeds size limit");
-        if (!got_headers) {
-            header_end = raw.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                if (header_end + 4U > kMaxHttpHeader) throw std::runtime_error("HTTP headers too large");
-                std::string headers = raw.substr(0, header_end);
-                std::size_t first_end = headers.find("\r\n");
-                if (first_end == std::string::npos || first_end > 4096U)
-                    throw std::runtime_error("malformed HTTP request line");
-                std::string first = headers.substr(0, first_end);
-                std::size_t first_space = first.find(' ');
-                std::size_t second_space = first_space == std::string::npos ? std::string::npos : first.find(' ', first_space + 1U);
-                if (first_space == std::string::npos || second_space == std::string::npos ||
-                    first_space == 0U || second_space == first_space + 1U || second_space + 1U >= first.size() ||
-                    first.find(' ', second_space + 1U) != std::string::npos)
-                    throw std::runtime_error("malformed HTTP request line");
-                req.method = first.substr(0, first_space);
-                req.path = first.substr(first_space + 1U, second_space - first_space - 1U);
-                std::string version = first.substr(second_space + 1U);
-                if (!std::all_of(req.method.begin(), req.method.end(), [](unsigned char c) { return http_token_char(c); }) ||
-                    req.path.empty() || req.path.front() != '/' || version != "HTTP/1.1")
-                    throw std::runtime_error("unsupported HTTP request line");
-                for (unsigned char c : req.path) if (c <= 0x20U || c >= 0x7fU)
-                    throw std::runtime_error("invalid HTTP request target");
-
-                bool have_length = false;
-                bool have_content_type = false;
-                unsigned host_count = 0;
-                std::size_t pos = first_end + 2U;
-                while (pos < headers.size()) {
-                    std::size_t line_end = headers.find("\r\n", pos);
-                    std::string field = headers.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
-                    if (field.empty() || field.front() == ' ' || field.front() == '\t')
-                        throw std::runtime_error("invalid or folded HTTP header");
-                    std::size_t colon = field.find(':');
-                    if (colon == std::string::npos || colon == 0U)
-                        throw std::runtime_error("malformed HTTP header");
-                    std::string name = field.substr(0, colon);
-                    if (!std::all_of(name.begin(), name.end(), [](unsigned char c) { return http_token_char(c); }))
-                        throw std::runtime_error("invalid HTTP header name");
-                    std::string value = trim_http_value(field.substr(colon + 1U));
-                    for (unsigned char c : value) if ((c < 0x20U && c != '\t') || c == 0x7fU)
-                        throw std::runtime_error("invalid HTTP header value");
-                    std::string normalized = lowercase_ascii(name);
-                    if (normalized == "host") {
-                        ++host_count;
-                        if (value.empty()) throw std::runtime_error("empty HTTP Host");
-                    } else if (normalized == "content-length") {
-                        if (have_length) throw std::runtime_error("duplicate Content-Length");
-                        body_length = parse_content_length(value);
-                        have_length = true;
-                    } else if (normalized == "content-type") {
-                        if (have_content_type) throw std::runtime_error("duplicate Content-Type");
-                        req.content_type = value;
-                        have_content_type = true;
-                    } else if (normalized == "transfer-encoding") {
-                        throw std::runtime_error("Transfer-Encoding is unsupported");
-                    }
-                    if (line_end == std::string::npos) break;
-                    pos = line_end + 2U;
-                }
-                if (host_count != 1U) throw std::runtime_error("HTTP/1.1 requires exactly one Host");
-                if (req.method == "POST" && !have_length)
-                    throw std::runtime_error("POST requires Content-Length");
-                if (req.method == "GET" && body_length != 0U)
-                    throw std::runtime_error("GET request body is unsupported");
-                got_headers = true;
-                if (raw.size() > header_end + 4U + body_length)
-                    throw std::runtime_error("bytes follow the framed HTTP request");
-            } else if (raw.size() > kMaxHttpHeader) {
-                throw std::runtime_error("HTTP headers too large");
-            }
-        }
-        if (got_headers) {
-            std::size_t expected_size = header_end + 4U + body_length;
+        const std::optional<agent::http::RequestHead> head = agent::http::parse_request_head(raw);
+        if (head) {
+            const std::size_t expected_size = head->header_size + head->body_size;
             if (raw.size() > expected_size) throw std::runtime_error("bytes follow the framed HTTP request");
-            if (raw.size() == expected_size) break;
+            if (raw.size() == expected_size) return agent::http::parse_request(raw);
         }
         int n = SSL_read(ssl, buffer.data(), static_cast<int>(buffer.size()));
         if (n <= 0) throw std::runtime_error("incomplete HTTP request body");
         raw.append(buffer.data(), static_cast<std::size_t>(n));
     }
-    req.body = raw.substr(header_end + 4U, body_length);
-    return req;
 }
 void write_all(SSL *ssl, const std::string &text) {
     std::size_t off = 0;
@@ -424,7 +319,7 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, SSL_CTX *ctx, i
         if (req.path == "/healthz" && req.method == "GET") {
             respond(ssl.get(), 200, "OK", "{\"status\":\"ok\"}");
         } else if (req.path == "/v1/agents/self/events:batch" && req.method == "POST") {
-            if (lowercase_ascii(req.content_type) != "application/json")
+            if (agent::http::lowercase_ascii(req.content_type) != "application/json")
                 throw std::runtime_error("event batch requires application/json Content-Type");
             ingest(db, agents, ssl.get(), req, identity);
         } else if (req.path == "/v1/agents/self/heartbeat" && req.method == "POST") {

@@ -4,7 +4,7 @@
 
 이 저장소는 endpoint agent와 loopback control server가 합성 상태 이벤트를 주고받는 교육용 구현입니다. 이벤트를 SQLite에 먼저 저장하고, 상호 TLS(mTLS)로 전송한 뒤, 서버가 확정한 이벤트 ID만 로컬 큐에서 제거합니다. transport peer 인증과 정책 발급자 인증을 분리하고, 재시도·중복 처리·최소 수집 경계를 코드로 살펴보도록 제작했습니다. 파일 감시, 개인 파일 수집, 임의 명령 실행 기능은 없습니다.
 
-GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과입니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 확장 재시작·오프라인·만료 행렬, fuzzing, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+GCC와 Clang 21.1.8 Release 빌드, 각 CTest 4/4, ASan/UBSan CTest 4/4, Clang 정적 분석, HTTP framing 음성 통합 사례가 통과했습니다. 분리한 HTTP request parser는 seed 입력을 이용한 Clang libFuzzer+ASan+UBSan 50,000회 실행에서도 실패를 찾지 못했습니다. Smoke는 서버 중단 중 queue 보존과 재시작 후 replay도 확인합니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. production enrollment/revocation, 운영자 권한 관리, 서버 정책 배포, 확장 재시작·오프라인·만료 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
@@ -15,7 +15,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang �
 | TLS client | 서버 인증서와 SAN을 검증하고 client 인증서를 제시합니다. | `client_context`, `connect_socket`, `send_batch` |
 | ACK와 재시도 | 모호한 응답이나 전송 실패 뒤에도 데이터를 잃지 않게 합니다. | `ack_ids`, `flush` |
 | TLS reference server | mTLS client와 allowlist를 확인하고 제한된 요청을 받습니다. | `run_server`, `serve_one`, `read_request` |
-| HTTP framing 경계 | 바이트 스트림에서 하나의 요청·응답 경계를 모호하지 않게 정하고 자원 사용을 제한합니다. | 양쪽 `http_exchange`와 `read_request` |
+| HTTP framing 경계 | 바이트 스트림에서 하나의 요청·응답 경계를 모호하지 않게 정하고 자원 사용을 제한합니다. | Agent `http_exchange`, `server/include/agent/http.hpp`의 `parse_request_head`·`parse_request`, TLS adapter `read_request` |
 | 제한된 JSON 파서 | 숫자 문법, 중복 키, 깊이와 입력 크기를 검증합니다. | `agent/include/agent/json.hpp`, `server/include/agent/json.hpp` |
 | 멱등 ingestion | 같은 이벤트 재전송은 구분해 승인하고, 같은 ID의 다른 내용은 거부합니다. | `ingest`, SQLite 고유 키 |
 | 정책 서명 검증 | TLS와 별개로 정책 작성자의 서명 및 범위를 검증합니다. | `validate_signed_policy` |
@@ -36,7 +36,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang �
 
 1. `run_server`는 loopback 이외의 bind를 거부하고, IPv4 loopback listener와 TLS 인증서를 준비합니다.
 2. `accept4(..., SOCK_CLOEXEC)`로 연결을 받고 `serve_one`이 mTLS handshake, CA chain, client 인증서 CN과 allowlist를 확인합니다. 이 구현은 연결을 한 번에 하나씩 처리합니다.
-3. `read_request`는 HTTP/1.1 request line과 header를 제한된 문법으로 읽습니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. 받은 socket의 read/write timeout은 5초입니다.
+3. `read_request`는 TLS에서 읽은 byte 조각을 `raw` 문자열에 모읍니다. transport-independent `parse_request_head`는 header 끝을 찾고 header·body 경계를 검사해, header가 아직 불완전하면 `nullopt`를 반환합니다. `parse_request`는 선언 길이와 실제 길이가 정확히 일치할 때만 소유형 `Request`를 반환합니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. 받은 socket의 read/write timeout은 5초입니다.
 4. `serve_one`이 health, status, telemetry, heartbeat, policy 경로를 분기합니다. `ingest`는 JSON schema, 주장된 agent ID, 인증서 identity, 이벤트 수, 민감 키, payload hash를 확인합니다.
 5. 서버는 `(agent_id,event_id)` 고유 키로 transaction에 기록하고 commit한 뒤에만 ACK를 보냅니다. 동일 sequence/hash의 재수신은 duplicate, 내용이 바뀐 ID 재사용은 오류가 됩니다.
 
@@ -50,6 +50,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang �
 - `SOCK_CLOEXEC`은 실행 파일을 새 프로세스로 바꿀 때 FD 누출을 줄입니다. `SO_RCVTIMEO`/`SO_SNDTIMEO`는 block I/O 대기를 제한하지만 전체 연결 처리의 절대 deadline, 동시성 한도, 서비스 rate limit을 제공하지는 않습니다.
 - `SSL_CTX`는 TLS 설정과 신뢰 정보를 보유하고 여러 `SSL` 세션의 기반이 됩니다. `SSL*`는 socket FD에 연결되어 handshake와 record I/O를 수행합니다. Agent와 Server의 `SSL*`는 `unique_ptr`, 양쪽 connected FD는 `ScopedFd`가 관리합니다. SQLite DB와 statement는 수동 정리 분기가 있어 예외 경로를 함께 추적해야 합니다.
 - C++ `std::string`, vector, map, parser `Value`는 자신이 소유한 메모리를 관리합니다. SQLite row를 읽을 때 statement가 유효한 동안 값을 복사해야 합니다. SQLite `sqlite3_stmt*`는 finalize 전까지 DB 자원을 점유합니다.
+- HTTP parser의 내부 `std::string_view`는 입력 `raw`가 살아 있는 동안만 사용하고, 반환 전에 method/path/body/content-type을 `std::string`으로 복사합니다. 따라서 호출자는 TLS 수신 buffer를 덮어써도 `Request`가 dangling view를 갖지 않습니다. fuzz harness도 입력을 view로 전달하고 parser 반환 뒤에 어떤 입력 포인터도 보관하지 않습니다.
 - `PRAGMA journal_mode=WAL`은 DB 옆 `-wal`/`-shm` 상태 파일과 checkpoint 동작을 수반합니다. DB 파일만 따로 복사하는 것은 일관된 백업이 아닐 수 있습니다. WAL에서도 동시에 쓰기는 하나의 writer로 직렬화됩니다.
 
 ## 동시성, 보안 가정, 실패
@@ -63,6 +64,7 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang �
 ## 대안과 설계 교환
 
 - 직접 만든 HTTP framing 파서는 학습에 적합하고 의존성이 적지만 RFC 전체를 구현하지 않습니다. 검증된 HTTP 라이브러리는 parser 표면을 줄여주지만 새 의존성과 통합 복잡성이 생깁니다.
+- 순수 parser를 TLS adapter에서 분리하면 같은 framing 규칙을 단위 테스트와 coverage-guided fuzzing에서 재사용할 수 있습니다. 짧은 libFuzzer 실행은 실행된 입력에서의 sanitizer 결함을 찾는 데 도움을 주지만 무결점이나 RFC 완전성을 증명하지 않습니다.
 - Unix domain socket은 로컬 전용 권한 모델을 단순하게 할 수 있지만 mTLS·SAN 연습을 제공하지 않습니다.
 - bounded worker pool은 처리량을 높일 수 있지만 FD, handshake, queue, DB writer를 함께 제한해야 합니다.
 - fingerprint 또는 SAN URI 기반 ID는 CN allowlist보다 명시적일 수 있지만 enrollment·rotation·revocation 수명주기가 필요합니다.
@@ -79,4 +81,5 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang �
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
 - SQLite: [WAL](https://www.sqlite.org/wal.html), [Atomic Commit](https://www.sqlite.org/atomiccommit.html)
 - IETF: [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110), [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)
+- LLVM: [libFuzzer — coverage-guided fuzz testing](https://llvm.org/docs/LibFuzzer.html)
 - systemd: [`systemd.exec`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(linux_secure_endpoint_agent VERSION 0.1.0 LANGUAGES C CXX)
 
+option(SEA_BUILD_HTTP_FUZZER "Build the Clang libFuzzer target for the pure HTTP request parser" OFF)
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
@@ -37,4 +39,20 @@ if(BUILD_TESTING)
     target_include_directories(sea-json-server-test PRIVATE server/include)
     target_compile_options(sea-json-server-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME sea-json-server-parser COMMAND sea-json-server-test)
+
+    add_executable(sea-http-parser-test tests/http_parser_test.cpp)
+    target_include_directories(sea-http-parser-test PRIVATE server/include)
+    target_compile_options(sea-http-parser-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME sea-http-request-parser COMMAND sea-http-parser-test)
+endif()
+
+if(SEA_BUILD_HTTP_FUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "SEA_BUILD_HTTP_FUZZER requires Clang with libFuzzer support")
+    endif()
+    add_executable(sea-http-parser-fuzz tests/http_parser_fuzz.cpp)
+    target_include_directories(sea-http-parser-fuzz PRIVATE server/include)
+    target_compile_options(sea-http-parser-fuzz PRIVATE -Wall -Wextra -Wpedantic -Werror
+        -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(sea-http-parser-fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
 endif()

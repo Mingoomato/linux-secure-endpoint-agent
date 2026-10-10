@@ -22,15 +22,15 @@
 
 **완료 기준:** 성공·실패 status 경계가 테스트에서 구분되고, 오류 본문에 ACK 배열이 있더라도 비성공 응답으로 큐 항목을 삭제하지 않습니다.
 
-## 실습 3 — 요청 head parser의 독립 단위 테스트
+## 실습 3 — 임의 TCP 조각 경계에서 HTTP head 재현
 
-**목표:** request line/header 해석을 body socket read와 분리해 테스트하기 쉬운 작은 경계로 만듭니다.
+**목표:** 같은 HTTP 요청이 TLS/TCP에서 서로 다른 조각 크기로 도착해도 framing 결과가 달라지지 않는지 독립적으로 검증합니다.
 
-**시작점:** `read_request`의 request-line 및 header 검사, `tests/smoke.sh`, CMake CTest 설정.
+**시작점:** `server/include/agent/http.hpp`의 `parse_request_head`·`parse_request`, `read_request`, `tests/http_parser_test.cpp`.
 
-유효한 GET/POST head와 빈 헤더, folded header, 중복 Content-Length, Transfer-Encoding, oversized header, 숫자 overflow를 포함하는 table-driven 테스트를 추가하세요. framing 정책은 RFC 9112와 프로젝트의 제한 subset에 맞게 기록하세요.
+유효한 GET/POST 요청을 byte 단위 두 조각, 여러 경계의 두 조각, 한 번에 전달하는 입력으로 나누어 보세요. 각 불완전 prefix가 너무 일찍 완성으로 판정되지 않고, 모든 byte가 모인 뒤 같은 method/path/body/content-type으로 끝나는지 자동 검사하세요. 잘못된 요청도 delimiter가 조각 경계에 걸리는 경우와 한 번에 전달하는 경우의 최종 판정이 일치하는지 확인하고 프로젝트의 제한 subset을 RFC 9112와 비교해 설명하세요.
 
-**완료 기준:** 각 유효 입력과 거부 입력이 자동으로 검증되고, socket I/O 테스트 없이도 head 해석 회귀를 확인할 수 있습니다.
+**완료 기준:** 대표적인 fragmentation 위치에서 분할 전달과 단일 전달의 결과가 일치하고, 이 회귀 시험을 socket I/O 없이 자동 실행할 수 있습니다.
 
 ## 본인 재현 기록
 

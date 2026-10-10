@@ -22,7 +22,7 @@
 
 `serve_one`은 accepted socket에 5초 receive/send timeout을 설정하고 TLS handshake를 진행합니다. client certificate chain을 확인한 뒤 `peer_cn`의 CN이 allowlist에 있는지 확인합니다. 따라서 mTLS 연결을 맺었다는 것만으로 애플리케이션 권한이 생기지 않습니다.
 
-`read_request`는 제한된 HTTP/1.1 parser입니다. request line은 origin-form path와 HTTP/1.1만 허용합니다. header는 최대 16 KiB, body는 1 MiB이며 Host 한 개를 요구하고 POST에는 단일 Content-Length를 요구합니다. event batch endpoint는 `application/json` Content-Type 한 개를 확인합니다. Transfer-Encoding, 중복 Content-Length/Content-Type, GET body, 잘못된 header와 초과 바이트는 처리하지 않습니다.
+HTTP 문법은 `server/include/agent/http.hpp`에 있는 순수 함수로 분리되어 있습니다. `parse_request_head`는 header delimiter가 아직 도착하지 않았으면 `nullopt`를 반환하고, 완성되면 `RequestHead`에 header 크기와 선언 body 길이를 둡니다. `parse_request`는 framing 길이가 정확히 맞을 때 body를 복사해 소유형 `Request`를 만듭니다. `read_request`는 TLS `SSL_read` 조각을 누적하고 이 두 함수를 이용해 요청이 완성될 때까지 읽습니다. request line은 origin-form path와 HTTP/1.1만 허용합니다. header는 최대 16 KiB, body는 1 MiB이며 Host 한 개를 요구하고 POST에는 단일 Content-Length를 요구합니다. event batch endpoint는 `application/json` Content-Type 한 개를 확인합니다. Transfer-Encoding, 중복 Content-Length/Content-Type, GET body, 잘못된 header와 초과 바이트는 처리하지 않습니다.
 
 경로 분기 뒤 event batch는 `ingest`로 갑니다. `ingest`가 JSON batch version, 인증서 identity와 body의 agent ID, 이벤트 수, 민감 키, payload hash를 검증합니다. SQLite transaction은 event ID 고유성으로 중복을 잡습니다. 같은 ID의 sequence와 hash가 동일하면 duplicate ACK에 추가하고, 내용이 다르면 rollback/error가 됩니다. DB commit이 끝난 뒤에만 응답을 작성합니다.
 
@@ -40,4 +40,4 @@ Agent와 Server의 `SSL_CTX`/`SSL*`는 `unique_ptr`를 사용하며 연결 socke
 
 `tests/smoke.sh`는 임시 디렉터리에서 로컬 CA를 만들고 loopback mTLS 연결, event ACK, deduplication, 충돌 ID 거부, allowlist 거부, 정책 signature/tamper/replay를 확인합니다. HTTP 음성 사례는 duplicate Content-Length, Transfer-Encoding, 잘못된/초과 길이, 누락 길이, HTTP/1.0, GET body, 중복 Host, 초과 header와 incomplete body timeout을 검사합니다. 또한 서버가 중단된 동안 agent event가 SQLite queue에 남고 server 재시작 뒤 같은 event가 전달되어 queue에서 제거되는 단일 recovery 경로를 실행합니다.
 
-`tests/json_parser_test.cpp`는 같은 테스트를 Agent와 Server의 JSON parser 사본 각각에 컴파일합니다. 이 구조는 두 사본의 drift를 줄이는 회귀 장치이지, 두 구현이 같음을 증명하거나 Unicode 전체를 처리한다는 뜻은 아닙니다.
+`tests/json_parser_test.cpp`는 같은 테스트를 Agent와 Server의 JSON parser 사본 각각에 컴파일합니다. `tests/http_parser_test.cpp`는 순수 HTTP parser의 정상·거부 경계와 크기 상한을 socket 없이 확인합니다. `tests/http_parser_fuzz.cpp`는 `-DSEA_BUILD_HTTP_FUZZER=ON`으로 별도 빌드하며, `tests/http_fuzz_corpus` seed로 libFuzzer 입력을 변형합니다. 이 구조는 두 JSON parser 사본의 drift를 줄이는 회귀 장치이지, 두 구현이 같음을 증명하거나 Unicode 전체를 처리한다는 뜻은 아닙니다. HTTP fuzz 입력은 짧은 개발 실행을 통과했지만 장기 fuzz campaign은 별도 검증입니다.
