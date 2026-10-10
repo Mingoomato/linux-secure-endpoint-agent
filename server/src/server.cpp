@@ -25,6 +25,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <iomanip>
 #include <locale>
@@ -78,8 +79,15 @@ sqlite3 *open_db(const std::string &path) {
     (void)chmod(path.c_str(), 0600);
     sqlite3_busy_timeout(db, 5000);
     const char *schema =
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;"
         "CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS agent_registry(agent_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),"
+        " created_at INTEGER NOT NULL,last_seen INTEGER);"
+        "CREATE TABLE IF NOT EXISTS agent_certificates(fingerprint TEXT PRIMARY KEY,agent_id TEXT NOT NULL"
+        " REFERENCES agent_registry(agent_id),state TEXT NOT NULL CHECK(state IN ('current','pending','retired','revoked'))"
+        " ,created_at INTEGER NOT NULL);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS agent_one_current_certificate ON agent_certificates(agent_id) WHERE state='current';"
+        "CREATE UNIQUE INDEX IF NOT EXISTS agent_one_pending_certificate ON agent_certificates(agent_id) WHERE state='pending';"
         "CREATE TABLE IF NOT EXISTS events(agent_id TEXT NOT NULL,event_id TEXT NOT NULL,"
         " sequence INTEGER NOT NULL,payload_hash TEXT NOT NULL,received_at INTEGER NOT NULL,"
         " PRIMARY KEY(agent_id,event_id));"
@@ -93,17 +101,39 @@ sqlite3 *open_db(const std::string &path) {
     }
     return db;
 }
-std::set<std::string> read_allowlist(const std::string &path) {
+std::set<std::string> read_allowlist(const std::string &path, bool may_be_empty = false) {
+    if (path.empty() && may_be_empty) return {};
     std::ifstream in(path);
-    if (!in) throw std::runtime_error("cannot open --agents allowlist");
+    if (!in) {
+        if (may_be_empty) return {};
+        throw std::runtime_error("cannot open allowlist");
+    }
     std::set<std::string> result;
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (!line.empty() && line.size() <= 128U) result.insert(line);
     }
-    if (result.empty()) throw std::runtime_error("agent allowlist is empty");
+    if (result.empty() && !may_be_empty) throw std::runtime_error("allowlist is empty");
     return result;
+}
+void seed_agent_registry(sqlite3 *db, const std::set<std::string> &agents) {
+    sqlite3_stmt *statement = nullptr;
+    sql_check(sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO agent_registry(agent_id,enabled,created_at) VALUES(?1,1,strftime('%s','now'))",
+        -1, &statement, nullptr), db, "prepare agent registry bootstrap");
+    try {
+        for (const auto &agent_id : agents) {
+            sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "bootstrap agent registry");
+            sqlite3_reset(statement);
+            sqlite3_clear_bindings(statement);
+        }
+        sqlite3_finalize(statement);
+    } catch (...) {
+        sqlite3_finalize(statement);
+        throw;
+    }
 }
 std::string peer_cn(SSL *ssl) {
     X509 *cert = SSL_get1_peer_certificate(ssl);
@@ -112,6 +142,39 @@ std::string peer_cn(SSL *ssl) {
     int n = X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, cn, sizeof(cn));
     X509_free(cert);
     return n > 0 ? std::string(cn, static_cast<std::size_t>(n)) : std::string{};
+}
+std::string peer_fingerprint(SSL *ssl) {
+    X509 *cert = SSL_get1_peer_certificate(ssl);
+    if (!cert) return {};
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_size = 0;
+    const bool ok = X509_digest(cert, EVP_sha256(), digest.data(), &digest_size) == 1 && digest_size == 32U;
+    X509_free(cert);
+    if (!ok) return {};
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string fingerprint;
+    fingerprint.reserve(64U);
+    for (unsigned int i = 0; i < digest_size; ++i) {
+        fingerprint.push_back(digits[digest[i] >> 4U]);
+        fingerprint.push_back(digits[digest[i] & 0x0fU]);
+    }
+    return fingerprint;
+}
+bool valid_agent_id(const std::string &value) {
+    if (value.size() != 36U) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (i == 8U || i == 13U || i == 18U || i == 23U) {
+            if (value[i] != '-') return false;
+        } else if (!((value[i] >= '0' && value[i] <= '9') ||
+                     (value[i] >= 'a' && value[i] <= 'f') ||
+                     (value[i] >= 'A' && value[i] <= 'F'))) return false;
+    }
+    return true;
+}
+bool valid_fingerprint(const std::string &value) {
+    return value.size() == 64U && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
 }
 bool contains_sensitive_key(const Value &v, unsigned depth=0) {
     if (depth > 32U) return true;
@@ -554,14 +617,349 @@ bool valid_admin_authorization(const std::string &header, const std::string &tok
         CRYPTO_memcmp(header.data(), expected.data(), expected.size()) == 0;
 }
 
-void ingest(sqlite3 *db, const std::set<std::string> &agents, SSL *ssl,
-            const Request &request, const std::string &identity) {
+bool authorize_agent_certificate(sqlite3 *db, const std::string &agent_id,
+                                 const std::string &fingerprint) {
+    if (!valid_agent_id(agent_id) || !valid_fingerprint(fingerprint)) return false;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw std::runtime_error("agent registry transaction unavailable");
+    try {
+        sqlite3_stmt *statement = nullptr;
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT enabled FROM agent_registry WHERE agent_id=?1", -1, &statement, nullptr),
+            db, "prepare agent registry authorization");
+        sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        const int registry_rc = sqlite3_step(statement);
+        const bool enabled = registry_rc == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1;
+        sqlite3_finalize(statement);
+        if (!enabled) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            return false;
+        }
+
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT agent_id,state FROM agent_certificates WHERE fingerprint=?1", -1, &statement, nullptr),
+            db, "prepare certificate pin lookup");
+        sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+        const int fingerprint_rc = sqlite3_step(statement);
+        std::string pinned_agent;
+        std::string certificate_state;
+        if (fingerprint_rc == SQLITE_ROW) {
+            const auto *id = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+            const auto *state = reinterpret_cast<const char *>(sqlite3_column_text(statement, 1));
+            if (id) pinned_agent = id;
+            if (state) certificate_state = state;
+        } else if (fingerprint_rc != SQLITE_DONE) {
+            sqlite3_finalize(statement);
+            throw std::runtime_error("certificate pin lookup failed");
+        }
+        sqlite3_finalize(statement);
+
+        if (fingerprint_rc == SQLITE_DONE) {
+            sql_check(sqlite3_prepare_v2(db,
+                "SELECT count(*) FROM agent_certificates WHERE agent_id=?1", -1, &statement, nullptr),
+                db, "prepare first certificate pin");
+            sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            const int count_rc = sqlite3_step(statement);
+            const sqlite3_int64 count = count_rc == SQLITE_ROW ? sqlite3_column_int64(statement, 0) : -1;
+            sqlite3_finalize(statement);
+            if (count_rc != SQLITE_ROW) throw std::runtime_error("certificate enrollment state unavailable");
+            if (count != 0) {
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                return false;
+            }
+            sql_check(sqlite3_prepare_v2(db,
+                "INSERT INTO agent_certificates(fingerprint,agent_id,state,created_at)"
+                " VALUES(?1,?2,'current',strftime('%s','now'))", -1, &statement, nullptr),
+                db, "prepare first-use certificate pin");
+            sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "pin first agent certificate");
+            sqlite3_finalize(statement);
+        } else {
+            if (pinned_agent != agent_id ||
+                (certificate_state != "current" && certificate_state != "pending")) {
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                return false;
+            }
+            if (certificate_state == "pending") {
+                sql_check(sqlite3_prepare_v2(db,
+                    "UPDATE agent_certificates SET state='retired' WHERE agent_id=?1 AND state='current'",
+                    -1, &statement, nullptr), db, "prepare certificate rotation retirement");
+                sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+                sql_check(sqlite3_step(statement), db, "retire prior certificate");
+                sqlite3_finalize(statement);
+                sql_check(sqlite3_prepare_v2(db,
+                    "UPDATE agent_certificates SET state='current' WHERE fingerprint=?1 AND state='pending'",
+                    -1, &statement, nullptr), db, "prepare certificate rotation promotion");
+                sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+                sql_check(sqlite3_step(statement), db, "promote rotated certificate");
+                sqlite3_finalize(statement);
+            }
+        }
+
+        sql_check(sqlite3_prepare_v2(db,
+            "UPDATE agent_registry SET last_seen=strftime('%s','now') WHERE agent_id=?1 AND enabled=1",
+            -1, &statement, nullptr), db, "prepare agent last-seen update");
+        sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        sql_check(sqlite3_step(statement), db, "update agent last-seen");
+        sqlite3_finalize(statement);
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("agent registry commit failed");
+        return true;
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
+    }
+}
+
+void require_fields(const Value &value, std::initializer_list<const char *> allowed) {
+    const auto *object = std::get_if<agent::json::Object>(&value.data);
+    if (!object) throw std::runtime_error("request body must be an object");
+    for (const auto &[name, field] : *object) {
+        (void)field;
+        const bool found = std::any_of(allowed.begin(), allowed.end(), [&name](const char *candidate) {
+            return name == candidate;
+        });
+        if (!found) throw std::runtime_error("request field rejected");
+    }
+}
+
+std::string agent_status_json(sqlite3 *db, const std::string &agent_id) {
+    sqlite3_stmt *statement = nullptr;
+    sql_check(sqlite3_prepare_v2(db,
+        "SELECT enabled,last_seen FROM agent_registry WHERE agent_id=?1", -1, &statement, nullptr),
+        db, "prepare self status");
+    sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(statement);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(statement);
+        throw std::runtime_error("agent registry status unavailable");
+    }
+    const bool enabled = sqlite3_column_int(statement, 0) == 1;
+    const bool has_last_seen = sqlite3_column_type(statement, 1) != SQLITE_NULL;
+    const sqlite3_int64 last_seen = sqlite3_column_int64(statement, 1);
+    sqlite3_finalize(statement);
+    std::ostringstream body;
+    body << "{\"schema_version\":\"agent_status.v1\",\"agent_id\":" << json_quote(agent_id)
+         << ",\"state\":" << json_quote(enabled ? "registered" : "revoked") << ",\"last_seen\":";
+    if (has_last_seen) body << last_seen;
+    else body << "null";
+    body << '}';
+    return body.str();
+}
+
+bool handle_agent_admin(sqlite3 *db, SSL *ssl, const Request &request,
+                        const std::string &identity, const std::set<std::string> &operators,
+                        const std::string &admin_token) {
+    const bool enroll_route = request.path == "/v1/admin/agents:enroll";
+    const bool rotate_route = request.path == "/v1/admin/agents:rotate";
+    const bool revoke_route = request.path == "/v1/admin/agents:revoke";
+    const bool reenroll_route = request.path == "/v1/admin/agents:reenroll";
+    const bool status_route = request.path.rfind("/v1/admin/agents/", 0U) == 0U;
+    if (!enroll_route && !rotate_route && !revoke_route && !reenroll_route && !status_route) return false;
+    if (!operators.contains(identity) || !valid_admin_authorization(request.authorization, admin_token)) {
+        respond(ssl, 403, "Forbidden", "{\"error\":\"SEA_OPERATOR_UNAUTHORIZED\"}");
+        return true;
+    }
+    if (status_route && request.method == "GET") {
+        const std::string agent_id = request.path.substr(std::string("/v1/admin/agents/").size());
+        if (!valid_agent_id(agent_id)) {
+            respond(ssl, 400, "Bad Request", "{\"error\":\"agent_id_invalid\"}");
+            return true;
+        }
+        sqlite3_stmt *statement = nullptr;
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT enabled,last_seen FROM agent_registry WHERE agent_id=?1", -1, &statement, nullptr),
+            db, "prepare admin agent status");
+        sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        const int rc = sqlite3_step(statement);
+        if (rc != SQLITE_ROW) {
+            sqlite3_finalize(statement);
+            respond(ssl, 404, "Not Found", "{\"error\":\"agent_not_registered\"}");
+            return true;
+        }
+        const bool enabled = sqlite3_column_int(statement, 0) == 1;
+        const bool has_last_seen = sqlite3_column_type(statement, 1) != SQLITE_NULL;
+        const sqlite3_int64 last_seen = sqlite3_column_int64(statement, 1);
+        sqlite3_finalize(statement);
+        std::ostringstream body;
+        body << "{\"schema_version\":\"agent_registry_status.v1\",\"agent_id\":" << json_quote(agent_id)
+             << ",\"enabled\":" << (enabled ? "true" : "false") << ",\"last_seen\":";
+        if (has_last_seen) body << last_seen;
+        else body << "null";
+        body << '}';
+        respond(ssl, 200, "OK", body.str());
+        return true;
+    }
+    if (request.method != "POST" ||
+        agent::http::lowercase_ascii(request.content_type) != "application/json") {
+        respond(ssl, 400, "Bad Request", "{\"error\":\"admin_agent_route_requires_json_post\"}");
+        return true;
+    }
+    try {
+        const Value body = agent::json::Parser(request.body).parse();
+        if (revoke_route) {
+            require_fields(body, {"agent_id"});
+            const std::string agent_id = required(body, "agent_id").string_or();
+            if (!valid_agent_id(agent_id)) throw std::runtime_error("agent_id_invalid");
+            if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("agent revoke transaction unavailable");
+            sqlite3_stmt *statement = nullptr;
+            sql_check(sqlite3_prepare_v2(db,
+                "UPDATE agent_registry SET enabled=0 WHERE agent_id=?1", -1, &statement, nullptr),
+                db, "prepare agent revoke");
+            sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "revoke agent");
+            const int changed = sqlite3_changes(db);
+            sqlite3_finalize(statement);
+            if (changed == 0) {
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                respond(ssl, 404, "Not Found", "{\"error\":\"agent_not_registered\"}");
+                return true;
+            }
+            sql_check(sqlite3_prepare_v2(db,
+                "UPDATE agent_certificates SET state='revoked' WHERE agent_id=?1 AND state IN ('current','pending')",
+                -1, &statement, nullptr), db, "prepare agent certificate revocation");
+            sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "revoke agent certificates");
+            sqlite3_finalize(statement);
+            if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("agent revoke commit failed");
+            respond(ssl, 200, "OK", "{\"status\":\"revoked\"}");
+            return true;
+        }
+
+        require_fields(body, {"agent_id", "certificate_sha256"});
+        const std::string agent_id = required(body, "agent_id").string_or();
+        const std::string fingerprint = required(body, "certificate_sha256").string_or();
+        if (!valid_agent_id(agent_id) || !valid_fingerprint(fingerprint))
+            throw std::runtime_error("agent_id_or_fingerprint_invalid");
+        if (reenroll_route) {
+            if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("agent reenrollment transaction unavailable");
+            sqlite3_stmt *statement = nullptr;
+            sql_check(sqlite3_prepare_v2(db,
+                "UPDATE agent_registry SET enabled=1,last_seen=NULL WHERE agent_id=?1 AND enabled=0",
+                -1, &statement, nullptr), db, "prepare agent reenrollment");
+            sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "reenable agent registry row");
+            const int changed = sqlite3_changes(db);
+            sqlite3_finalize(statement);
+            if (changed != 1) {
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                respond(ssl, 409, "Conflict", "{\"error\":\"agent_not_revoked_or_unknown\"}");
+                return true;
+            }
+            sql_check(sqlite3_prepare_v2(db,
+                "INSERT INTO agent_certificates(fingerprint,agent_id,state,created_at)"
+                " VALUES(?1,?2,'current',strftime('%s','now'))", -1, &statement, nullptr),
+                db, "prepare replacement agent certificate");
+            sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "register replacement agent certificate");
+            sqlite3_finalize(statement);
+            if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("agent reenrollment commit failed");
+            respond(ssl, 201, "Created", "{\"status\":\"reenrolled\"}");
+            return true;
+        }
+        if (enroll_route) {
+            if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("agent enrollment transaction unavailable");
+            sqlite3_stmt *statement = nullptr;
+            sql_check(sqlite3_prepare_v2(db,
+                "INSERT OR IGNORE INTO agent_registry(agent_id,enabled,created_at)"
+                " VALUES(?1,1,strftime('%s','now'))", -1, &statement, nullptr),
+                db, "prepare agent enrollment");
+            sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "enroll agent");
+            const int inserted = sqlite3_changes(db);
+            sqlite3_finalize(statement);
+            if (inserted != 1) {
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                respond(ssl, 409, "Conflict", "{\"error\":\"agent_already_registered\"}");
+                return true;
+            }
+            sql_check(sqlite3_prepare_v2(db,
+                "INSERT INTO agent_certificates(fingerprint,agent_id,state,created_at)"
+                " VALUES(?1,?2,'current',strftime('%s','now'))", -1, &statement, nullptr),
+                db, "prepare initial agent certificate");
+            sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(statement, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sql_check(sqlite3_step(statement), db, "store initial agent certificate");
+            sqlite3_finalize(statement);
+            if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+                throw std::runtime_error("agent enrollment commit failed");
+            respond(ssl, 201, "Created", "{\"status\":\"registered\"}");
+            return true;
+        }
+        if (!rotate_route) {
+            respond(ssl, 404, "Not Found", "{\"error\":\"not_found\"}");
+            return true;
+        }
+        if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("certificate rotation transaction unavailable");
+        sqlite3_stmt *statement = nullptr;
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT enabled FROM agent_registry WHERE agent_id=?1", -1, &statement, nullptr),
+            db, "prepare certificate rotation agent");
+        sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        const int agent_rc = sqlite3_step(statement);
+        const bool enabled = agent_rc == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1;
+        sqlite3_finalize(statement);
+        if (!enabled) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            respond(ssl, 404, "Not Found", "{\"error\":\"active_agent_not_registered\"}");
+            return true;
+        }
+        sql_check(sqlite3_prepare_v2(db,
+            "SELECT state FROM agent_certificates WHERE fingerprint=?1 AND agent_id=?2",
+            -1, &statement, nullptr), db, "prepare existing rotated certificate");
+        sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        const int existing_rc = sqlite3_step(statement);
+        std::string existing_state;
+        if (existing_rc == SQLITE_ROW) {
+            const auto *state = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+            if (state) existing_state = state;
+        }
+        sqlite3_finalize(statement);
+        if (existing_state == "current" || existing_state == "pending") {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            respond(ssl, 200, "OK", "{\"status\":\"already_registered\"}");
+            return true;
+        }
+        sql_check(sqlite3_prepare_v2(db,
+            "UPDATE agent_certificates SET state='revoked' WHERE agent_id=?1 AND state='pending'",
+            -1, &statement, nullptr), db, "prepare old pending certificate replacement");
+        sqlite3_bind_text(statement, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        sql_check(sqlite3_step(statement), db, "retire previous pending certificate");
+        sqlite3_finalize(statement);
+        sql_check(sqlite3_prepare_v2(db,
+            "INSERT INTO agent_certificates(fingerprint,agent_id,state,created_at)"
+            " VALUES(?1,?2,'pending',strftime('%s','now'))", -1, &statement, nullptr),
+            db, "prepare pending rotated certificate");
+        sqlite3_bind_text(statement, 1, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        sql_check(sqlite3_step(statement), db, "store pending rotated certificate");
+        sqlite3_finalize(statement);
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw std::runtime_error("certificate rotation commit failed");
+        respond(ssl, 202, "Accepted", "{\"status\":\"pending_rotation\"}");
+        return true;
+    } catch (const std::exception &) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        respond(ssl, 400, "Bad Request", "{\"error\":\"agent_registry_request_rejected\"}");
+        return true;
+    }
+}
+
+void ingest(sqlite3 *db, SSL *ssl, const Request &request, const std::string &identity) {
     Value batch = agent::json::Parser(request.body).parse();
     if (required(batch, "schema_version").string_or() != "agent_batch.v1")
         throw std::runtime_error("protocol schema mismatch");
     std::string claimed = required(batch, "agent_id").string_or();
-    if (claimed != identity || !agents.contains(identity))
-        throw std::runtime_error("agent identity mismatch or not registered");
+    if (claimed != identity) throw std::runtime_error("agent identity mismatch or not registered");
     const Value &events_value = required(batch, "events");
     const auto *events = std::get_if<Array>(&events_value.data);
     if (!events || events->size() > 100U) throw std::runtime_error("invalid batch size");
@@ -629,7 +1027,7 @@ void ingest(sqlite3 *db, const std::set<std::string> &agents, SSL *ssl,
     respond(ssl, 200, "OK", body.str());
 }
 
-void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<std::string> &operators,
+void serve_one(sqlite3 *db, const std::set<std::string> &operators,
                const std::string &admin_token, const std::string &tenant, EVP_PKEY *policy_key,
                SSL_CTX *ctx, int fd, std::chrono::milliseconds request_deadline,
                std::chrono::milliseconds handshake_deadline) {
@@ -659,7 +1057,16 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<
         return;
     }
     std::string identity = peer_cn(ssl.get());
-    if (identity.empty() || (!agents.contains(identity) && !operators.contains(identity))) {
+    const bool operator_identity = operators.contains(identity);
+    bool agent_identity = false;
+    if (!identity.empty() && !operator_identity) {
+        try {
+            agent_identity = authorize_agent_certificate(db, identity, peer_fingerprint(ssl.get()));
+        } catch (const std::exception &) {
+            std::cerr << "agent registry authorization failed\n";
+        }
+    }
+    if (identity.empty() || (!agent_identity && !operator_identity)) {
         respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_AGENT_UNAUTHORIZED\"}");
         SSL_shutdown(ssl.get()); return;
     }
@@ -667,7 +1074,7 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<
         const auto deadline = std::chrono::steady_clock::now() + request_deadline;
         Request req = read_request(ssl.get(), socket_fd.get(), deadline);
         if (req.path == "/v1/admin/policies" && req.method == "POST") {
-            if (!operators.contains(identity) || !valid_admin_authorization(req.authorization, admin_token)) {
+            if (!operator_identity || !valid_admin_authorization(req.authorization, admin_token)) {
                 respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_OPERATOR_UNAUTHORIZED\"}");
             } else if (agent::http::lowercase_ascii(req.content_type) != "application/json") {
                 respond(ssl.get(), 400, "Bad Request", "{\"error\":\"policy_requires_json\"}");
@@ -679,18 +1086,23 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, const std::set<
                 respond(ssl.get(), published.unchanged ? 200 : 201,
                     published.unchanged ? "OK" : "Created", body);
             }
+        } else if (handle_agent_admin(db, ssl.get(), req, identity, operators, admin_token)) {
+            // The handler sends its own response after operator mTLS and token authorization.
         } else if (req.path == "/healthz" && req.method == "GET") {
             respond(ssl.get(), 200, "OK", "{\"status\":\"ok\"}");
-        } else if (!agents.contains(identity)) {
+        } else if (!agent_identity) {
             respond(ssl.get(), 403, "Forbidden", "{\"error\":\"SEA_AGENT_UNAUTHORIZED\"}");
         } else if (req.path == "/v1/agents/self/events:batch" && req.method == "POST") {
             if (agent::http::lowercase_ascii(req.content_type) != "application/json")
                 throw std::runtime_error("event batch requires application/json Content-Type");
-            ingest(db, agents, ssl.get(), req, identity);
+            ingest(db, ssl.get(), req, identity);
         } else if (req.path == "/v1/agents/self/heartbeat" && req.method == "POST") {
-            respond(ssl.get(), 200, "OK", "{\"schema_version\":\"heartbeat_ack.v1\",\"status\":\"ok\"}");
+            const auto policy = current_policy(db, tenant);
+            respond(ssl.get(), 200, "OK", "{\"schema_version\":\"heartbeat_ack.v1\",\"status\":\"ok\",\"server_time\":\"" +
+                std::to_string(static_cast<long long>(time(nullptr))) + "\",\"policy_revision\":" +
+                (policy ? std::to_string(policy->revision) : std::string("null")) + "}");
         } else if (req.path == "/v1/agents/self/status" && req.method == "GET") {
-            respond(ssl.get(), 200, "OK", "{\"schema_version\":\"agent_status.v1\",\"state\":\"registered\"}");
+            respond(ssl.get(), 200, "OK", agent_status_json(db, identity));
         } else if (req.path == "/v1/agents/self/policy" && req.method == "GET") {
             const auto policy = current_policy(db, tenant);
             if (!policy) {
@@ -741,7 +1153,7 @@ int run_server(int argc, char **argv) {
     if (handshake_deadline_ms < 100 || handshake_deadline_ms > 60000)
         throw std::runtime_error("TLS handshake deadline must be between 100 and 60000 ms");
     const auto handshake_deadline = std::chrono::milliseconds(handshake_deadline_ms);
-    std::set<std::string> agents = read_allowlist(agents_file);
+    std::set<std::string> agents = read_allowlist(agents_file, true);
     std::set<std::string> operators = read_allowlist(operators_file);
     if (tenant.empty() || tenant.size() > 128U) throw std::runtime_error("--tenant must be configured");
     const std::string admin_token = read_admin_token(admin_token_file);
@@ -761,6 +1173,7 @@ int run_server(int argc, char **argv) {
         SSL_CTX_free(ctx); throw std::runtime_error("server key must have mode 0600");
     }
     sqlite3 *db = open_db(dbfile);
+    seed_agent_registry(db, agents);
     int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener < 0) { sqlite3_close(db); SSL_CTX_free(ctx); throw std::runtime_error("socket failed"); }
     int one = 1; (void)setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -789,7 +1202,7 @@ int run_server(int argc, char **argv) {
             continue;
         }
         if (fd < 0) break;
-        serve_one(db, agents, operators, admin_token, tenant, policy_key.get(), ctx, fd,
+        serve_one(db, operators, admin_token, tenant, policy_key.get(), ctx, fd,
             request_deadline, handshake_deadline);
     }
     close(listener); sqlite3_close(db); SSL_CTX_free(ctx);
@@ -800,9 +1213,10 @@ int run_server(int argc, char **argv) {
 int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
-            std::cout << "sw-server run --cert FILE --key FILE --ca FILE --agents FILE --operators FILE "
-                         "--admin-token-file FILE --policy-key FILE --tenant ID "
-                         "[--db FILE --port N --request-deadline-ms N]\n";
+            std::cout << "sw-server run --cert FILE --key FILE --ca FILE --operators FILE "
+                          "--admin-token-file FILE --policy-key FILE --tenant ID "
+                          "[--agents BOOTSTRAP_FILE --db FILE --port N --request-deadline-ms N]\n"
+                          "Admin agent registry: /v1/admin/agents:enroll, :rotate, :revoke, :reenroll\n";
             return argc < 2 ? 2 : 0;
         }
         if (std::string(argv[1]) != "run") throw std::runtime_error("unknown command");

@@ -54,6 +54,12 @@ Agent의 `sync-policy`는 local last-good 문서가 있으면 그 SHA-256을 `If
 
 `IN_Q_OVERFLOW`, watch 손실, 디렉터리 접근 실패는 coverage를 degraded로 만들고 제한적으로 재구성합니다. 놓친 이벤트를 baseline scan으로 재구축하지 않으므로 재구성 성공을 완전한 복구라고 표시하지 않습니다. Collector와 SQLite 처리는 단일 event loop에서 순차 실행합니다. 새 collector code는 마지막으로 기록된 build/test 이후 추가되었고 아직 실행 검증을 하지 않았습니다.
 
+## 4b. Server agent registry와 인증서 lifecycle
+
+`open_db`는 `agent_registry`와 `agent_certificates`를 생성합니다. 시작 시 optional `--agents`의 UUID가 bootstrap registry row로 들어가며, 기존 disabled row를 자동 활성화하지 않습니다. mTLS chain 검증 뒤 `peer_cn`으로 UUID를 추출하고 `peer_fingerprint`가 SHA-256 certificate fingerprint를 만듭니다. `authorize_agent_certificate`는 SQLite immediate transaction에서 enabled 상태와 fingerprint history를 읽습니다. certificate history가 없는 seeded ID는 첫 CA-valid certificate를 current로 pin합니다. 기존 current pin만 그대로 허용하고, pending pin은 첫 사용 때 prior current를 retired로 바꾼 뒤 current로 promote합니다. retired/revoked 또는 다른 ID에 매핑된 fingerprint는 거부합니다. 성공 요청은 `last_seen`을 갱신합니다.
+
+Operator route는 operator mTLS CN allowlist와 독립 bearer token을 모두 확인합니다. `:enroll`은 ID와 fingerprint를 신규 생성하고, `:rotate`는 새 pending pin을 만들어 두 자격증명이 전환 시간 동안 동작하게 합니다. 새 cert의 첫 성공 접속 후 old cert는 retired됩니다. `:revoke`는 agent를 disable하고 current/pending pins를 revoked로 바꿉니다. `:reenroll`은 disabled ID에 이전 이력이 없는 새 fingerprint를 등록합니다. GET `/v1/admin/agents/{id}`는 enabled/last_seen만 반환합니다. 신규 endpoint 코드는 마지막 기록된 검증 이후 추가되어 실행 검증을 하지 않았습니다.
+
 ## 5. 예외와 소유권 추적
 
 Agent와 Server의 `SSL_CTX`/`SSL*`는 `unique_ptr`를 사용하며 연결 socket FD는 `ScopedFd`가 정리합니다. SQLite handle/statement와 일부 policy OpenSSL 객체는 수동 정리하는 경로가 있습니다. 코드를 변경할 때 각 할당 이후 `throw`, 조기 `return`, TLS 실패가 발생하면 어떤 객체가 해제되는지 확인해야 합니다.

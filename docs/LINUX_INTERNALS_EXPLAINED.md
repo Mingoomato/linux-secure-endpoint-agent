@@ -70,6 +70,12 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 예제 unit은 전용 사용자, `NoNewPrivileges`, 제한된 파일시스템 view, private temporary directory, 명시 writable 경로를 보여줍니다. 실제 설치·사용자 생성·key provisioning·uninstall은 구현되지 않았습니다. service sandbox는 TLS와 애플리케이션 인증 대신 사용할 수 없습니다.
 
+## X.509 certificate pin과 registry transaction
+
+OpenSSL의 mTLS chain 검증은 CA path와 certificate validity를 확인합니다. 이후 `SSL_get1_peer_certificate`로 peer certificate를 참조 획득하고 `X509_digest(..., EVP_sha256())`로 fingerprint를 계산합니다. CN은 registry의 agent UUID와 대조하므로 인증서 이름만 같은 impostor가 고정된 fingerprint를 우회할 수 없습니다. Fingerprint는 공개 certificate의 식별자이며 private key가 아닙니다.
+
+Registry authorization은 `BEGIN IMMEDIATE`로 enabled 상태, current/pending/revoked pin, last_seen 갱신을 하나의 writer transaction 안에서 다룹니다. Concurrent admin revoke와 인증은 DB writer lock으로 직렬화됩니다. Pending rotation certificate를 받아들이면 current row를 retired로 바꾸고 pending을 current로 승격합니다. `BEGIN IMMEDIATE`는 writer lock을 초기에 획득하므로 중간 상태가 다른 SQLite writer에 보이지 않습니다. SQL/commit 오류는 rollback으로 처리하고 새로운 인증은 허용하지 않는 fail-closed 경계입니다. 인증서 registry endpoint 코드는 이 문서 갱신 시점에 아직 build/test하지 않았습니다.
+
 ## inotify collector의 syscall 흐름
 
 `inotify_init1(IN_NONBLOCK | IN_CLOEXEC)`는 daemon이 소유할 FD 하나를 만들고, `inotify_add_watch`는 디렉터리별 create/close-write/attribute/delete/move mask를 등록합니다. 파일마다 FD를 열지 않습니다. `poll`은 250ms 이하로 readiness를 기다리고, `read`는 커널이 만든 `inotify_event` 레코드 배열을 비운 뒤 mask별 이벤트를 구분합니다. `IN_Q_OVERFLOW`는 어느 경로 이벤트가 빠졌는지 알 수 없으므로 degraded coverage로 취급합니다.

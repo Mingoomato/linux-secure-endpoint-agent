@@ -92,6 +92,12 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 
 `docs/ARCHITECTURE.md`, `docs/THREAT_MODEL.md`, `docs/KEY_MANAGEMENT.md`를 먼저 읽습니다. 그다음 합성 event 하나를 SQLite insert부터 TLS, server commit, ACK, agent delete까지 추적하고, ACK 유실 시 재전송을 비교합니다. 마지막으로 정책 서명 검증에서 TLS identity와 issuer signature가 서로 대체할 수 없는 이유를 설명해 봅니다. `docs/DEBUGGING_EXERCISES.md`에는 정답 없이 세 개의 독립 구현 과제가 있습니다.
 
+## Agent registry와 인증서 lifecycle
+
+Registry는 허용된 UUID, enabled/revoked 상태, last_seen, 인증서 fingerprint history를 관리합니다. mTLS chain 검증은 certificate가 trusted CA에서 발급되고 유효기간 안에 있는지 확인하고, SHA-256 pin은 같은 CN을 가진 certificate 교체/복제를 구별합니다. 명시 enroll은 operator mTLS identity와 bearer token을 모두 요구하며, offline pre-registration용 `--agents`는 UUID만 bootstrap합니다. Bootstrap UUID의 최초 인증서는 TOFU pin으로 저장됩니다.
+
+Rotation에서는 current와 pending pin이 잠시 동시에 허용됩니다. 새 certificate가 first-use로 성공하면 SQLite transaction 안에서 old를 retired, pending을 current로 바꿉니다. Revoke는 agent를 disabled로 만들고 current/pending pin을 revoked 처리합니다. Re-enroll은 이전에 revoke된 UUID에 새 fingerprint를 연결하지만 과거 fingerprint 재사용은 허용하지 않습니다. Registry DB write가 실패하면 연결을 거부해야 합니다. 이 코드는 구현됐으나 새 코드의 build/test 검증은 미실행입니다.
+
 ## 장기 실행 inotify collector와 policy 적용
 
 ### 이 하위 시스템이 필요한 이유

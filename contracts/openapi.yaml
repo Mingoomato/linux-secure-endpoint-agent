@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: LinuxSecurity lab control API
-  version: 1.0.0
+  version: 1.1.0
 servers:
   - url: https://127.0.0.1:8443
     description: Loopback-only lab server
@@ -14,7 +14,9 @@ paths:
     get:
       security: [{agentCertificate: []}]
       responses:
-        "304": {description: No changed policy in the reference server}
+        "200": {description: Current signed policy envelope}
+        "304": {description: No changed policy}
+        "403": {description: Certificate is not registered or is revoked}
   /v1/agents/self/events:batch:
     post:
       security: [{agentCertificate: []}]
@@ -26,17 +28,110 @@ paths:
     post:
       security: [{agentCertificate: []}]
       responses:
-        "200": {description: Heartbeat acknowledged}
+        "200": {description: Heartbeat acknowledgement, server timestamp, and policy revision}
   /v1/agents/self/status:
     get:
       security: [{agentCertificate: []}]
       responses:
-        "200": {description: Registered agent status}
+        "200": {description: Registered agent status and last-seen timestamp}
   /v1/admin/policies:
     post:
+      security:
+        - operatorCertificate: []
+          adminToken: []
       responses:
-        "403": {description: Disabled in this lab build}
+        "201": {description: New signed policy published}
+        "200": {description: Idempotent policy publication}
+        "403": {description: Operator mTLS identity or bearer token is not authorized}
+  /v1/admin/agents:enroll:
+    post:
+      security:
+        - operatorCertificate: []
+          adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AgentCertificateRequest'}
+      responses:
+        "201": {description: Agent identity and certificate fingerprint registered}
+        "409": {description: Agent identity is already registered}
+        "403": {description: Operator authorization failed}
+  /v1/admin/agents:reenroll:
+    post:
+      security:
+        - operatorCertificate: []
+          adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AgentCertificateRequest'}
+      responses:
+        "201": {description: Revoked agent re-enabled with a new certificate}
+        "409": {description: Agent is not currently revoked or fingerprint was previously used}
+        "403": {description: Operator authorization failed}
+  /v1/admin/agents:rotate:
+    post:
+      security:
+        - operatorCertificate: []
+          adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AgentCertificateRequest'}
+      responses:
+        "202": {description: New certificate is pending first successful authenticated use}
+        "200": {description: Certificate is already current or pending}
+        "403": {description: Operator authorization failed}
+  /v1/admin/agents:revoke:
+    post:
+      security:
+        - operatorCertificate: []
+          adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AgentIdRequest'}
+      responses:
+        "200": {description: Agent identity and active certificates revoked}
+        "404": {description: Agent identity is not registered}
+        "403": {description: Operator authorization failed}
+  /v1/admin/agents/{agent_id}:
+    get:
+      security:
+        - operatorCertificate: []
+          adminToken: []
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200": {description: Enabled state and last-seen timestamp}
+        "404": {description: Agent identity is not registered}
 components:
   securitySchemes:
     agentCertificate:
       type: mutualTLS
+    operatorCertificate:
+      type: mutualTLS
+    adminToken:
+      type: http
+      scheme: bearer
+  schemas:
+    AgentIdRequest:
+      type: object
+      additionalProperties: false
+      required: [agent_id]
+      properties:
+        agent_id: {type: string, format: uuid}
+    AgentCertificateRequest:
+      type: object
+      additionalProperties: false
+      required: [agent_id, certificate_sha256]
+      properties:
+        agent_id: {type: string, format: uuid}
+        certificate_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}

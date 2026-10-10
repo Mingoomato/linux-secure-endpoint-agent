@@ -36,3 +36,13 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 - Root 외부 symlink, symlink directory, 다른 device mount, directory rename, permission loss, inotify watch cap/overflow를 각각 재현하고 coverage degraded 동작을 확인한다.
 - Running agent에서 revision/root replacement, telemetry disable, expiry, sample-rate update를 적용하고 queue retention/flush 계약을 확인한다.
 - Agent/service stop, restart, `sync-policy` 동시 실행과 quota/full-disk 상황에서 FD, PID file, SQLite transaction lifetime을 관찰한다.
+
+## 추가 구현 후 실행할 agent registry 확인 항목
+
+아래 lifecycle 경로는 구현됐으나 아직 실행 검증하지 않았다.
+
+- Optional bootstrap UUID의 첫 CA-valid mTLS certificate fingerprint pin과 같은 CN의 다른 인증서 거부를 확인한다.
+- Operator mTLS와 독립 bearer token 조합으로 신규 enroll, status, revoke, 신규 fingerprint re-enroll을 확인한다.
+- Rotation 도중 current/pending 인증서를 모두 허용하고, pending 인증서 첫 성공 접속 시 current 승격 및 old cert retirement를 확인한다.
+- Server restart 후 enabled/revoked 상태와 certificate history가 SQLite에서 유지되는지 확인한다.
+- Malformed UUID/fingerprint, 다른 agent가 이미 사용하는 fingerprint, 등록되지 않은 certificate, 만료/미등록 CA certificate를 거부하고 민감 값을 로그에 남기지 않는지 확인한다.

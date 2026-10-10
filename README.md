@@ -14,7 +14,7 @@ cmake --build build --parallel
 ./scripts/create-local-ca.sh /tmp/linuxsecurity-lab-certs
 ```
 
-서버 시작 명령, 운영자 API 호출, `sync-policy` 예시는 아래 English 섹션을 참고하세요. 인증서와 개인 키는 저장소 밖의 전용 실습 디렉터리에 만들며, 다른 용도로 재사용하거나 커밋하지 않습니다. 서버와 client는 loopback만 허용합니다.
+서버 시작 명령, 운영자 API 호출, `sync-policy` 예시는 아래 English 섹션을 참고하세요. 인증서와 개인 키는 저장소 밖의 전용 실습 디렉터리에 만들며, 다른 용도로 재사용하거나 커밋하지 않습니다. 서버와 client는 loopback만 허용합니다. `--agents` 파일은 기존 UUID를 registry에 bootstrap하는 선택 기능이며 첫 CA 검증 인증서를 fingerprint로 고정합니다. 새 UUID는 아래 operator registry API로 등록할 수 있습니다.
 
 ### 검증 및 한계
 
@@ -61,6 +61,13 @@ In an operator-authorized terminal, prepare a minimal policy and create the allo
 Publish a policy from an operator-authorized terminal:
 
     curl --cacert /tmp/linuxsecurity-lab-certs/ca.crt --cert /tmp/linuxsecurity-lab-certs/operator.crt --key /tmp/linuxsecurity-lab-certs/operator.key -H "Authorization: Bearer $(cat /tmp/linuxsecurity-lab-certs/admin.token)" -H 'Content-Type: application/json' --data-binary @/tmp/linuxsecurity-lab-certs/policy.json https://127.0.0.1:8443/v1/admin/policies
+
+The server stores agent UUIDs and SHA-256 certificate fingerprints in SQLite. The optional `--agents` file seeds registered UUIDs; for a seeded UUID with no certificate history, the first certificate that passes CA validation is pinned. For explicit enrollment and lifecycle control, the operator must present both the operator certificate and bearer token. The API stores a fingerprint, never a private key:
+
+    cert_fingerprint=$(openssl x509 -in /tmp/linuxsecurity-lab-certs/agent.crt -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
+    curl --cacert /tmp/linuxsecurity-lab-certs/ca.crt --cert /tmp/linuxsecurity-lab-certs/operator.crt --key /tmp/linuxsecurity-lab-certs/operator.key -H "Authorization: Bearer $(cat /tmp/linuxsecurity-lab-certs/admin.token)" -H 'Content-Type: application/json' --data "{\"agent_id\":\"00000000-0000-4000-8000-000000000001\",\"certificate_sha256\":\"$cert_fingerprint\"}" https://127.0.0.1:8443/v1/admin/agents:enroll
+
+Use `/v1/admin/agents:rotate` to stage a second fingerprint; the existing and pending certificate are both accepted until the new certificate first connects, then the old fingerprint is retired. `/v1/admin/agents:revoke` disables the identity and revokes active pins; `/v1/admin/agents:reenroll` accepts a new fingerprint for a revoked UUID. `GET /v1/admin/agents/{agent_id}` returns enabled state and last-seen time. These registry routes were added after the last recorded verification and have not been built or exercised.
 
 The new policy returns `201`; an identical publication returns `200`. The server signs the exact policy bytes and stores one monotonic revision per configured tenant. Sync it on the agent:
 

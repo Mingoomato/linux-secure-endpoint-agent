@@ -76,4 +76,4 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 
 ## Changes after the last recorded verification
 
-The agent now has code for recursive inotify metadata collection and runtime replacement of the watch set when policy roots or revision change. The user requested implementation work to continue without verification, so no build, test, schema, or static-analysis command has been run after this code change. This report therefore records historical evidence only and does not claim the collector is technically verified.
+The agent now has code for recursive inotify metadata collection and runtime replacement of the watch set when policy roots or revision change. The server also now has a SQLite agent registry with certificate SHA-256 pinning and operator-authenticated enroll/rotate/revoke/re-enroll/status routes. The user requested implementation work to continue without verification, so no build, test, schema, or static-analysis command has been run after either code change. This report therefore records historical evidence only and does not claim the collector is technically verified.

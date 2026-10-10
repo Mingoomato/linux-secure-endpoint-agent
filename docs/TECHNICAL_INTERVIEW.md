@@ -106,4 +106,16 @@ Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변
 75. Collector가 다른 `st_dev`의 하위 디렉터리를 건너뛰는 이유와 같은 device의 bind mount에 대한 잔여 위험을 설명하세요.
 76. Queue quota가 찼을 때 collector는 어떤 coverage 상태로 전환하나요? coverage 이벤트를 큐에 넣을 수 없는 경우 운영자에게 이를 전달할 다른 경로는 무엇인가요?
 
-공식 참고: Linux [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), OpenSSL [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/), SQLite [WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html).
+
+## Agent registry와 certificate lifecycle
+
+77. Registry `agent_id`를 certificate CN에서 읽고 fingerprint를 별도로 pin하는 이유는 무엇인가요? CN만 allowlist하는 모델에서 발생하는 인증서 교체/복제 위험과 fingerprint만 쓰는 모델의 관리상 단점을 비교하세요.
+78. `authorize_agent_certificate`가 `BEGIN IMMEDIATE` 안에서 enabled 상태·fingerprint history·last_seen을 다루는 이유는 무엇인가요? DB write가 실패하면 인증 판단에 어떤 영향을 주어야 하나요?
+79. Bootstrap ID에 대해 첫 인증서를 TOFU로 pin할 때 보안 경계는 무엇인가요? CA 검증이나 operator allowlist가 빠지면 어떤 공격이 가능해지나요?
+80. Rotation 중 current와 pending certificate를 동시에 허용하는 구간에서 old cert는 언제 retired되나요? 새 인증서가 한 번도 성공하지 않을 때 복구 절차는 무엇이어야 하나요?
+81. `:revoke`와 `:reenroll`을 별도 transaction으로 나눈 이유는 무엇인가요? Re-enrollment에 과거와 같은 fingerprint를 다시 허용하지 않아야 하는 이유는 무엇인가요?
+82. Operator route에서 mTLS allowlist와 bearer token을 모두 요구하는 이유는 무엇인가요? 토큰, certificate fingerprint, private key가 로그·응답에 나타나지 않게 하려면 어디를 살펴봐야 하나요?
+83. `/v1/admin/agents/{id}`의 상태 응답에서 fingerprint 전체를 반환하지 않는 설계의 이점과 운영상 단점은 무엇인가요?
+84. 현재 registry row를 SQLite에서 revoke하면 이미 완료된 TLS handshake가 열린 연결에 미치는 영향은 무엇인가요? 다중 요청 연결을 허용하도록 바꾸면 어떤 재인증/차단 경계가 필요할까요?
+
+공식 참고: Linux [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`sqlite3` transaction API](https://www.sqlite.org/lang_transaction.html), OpenSSL [`X509_digest`](https://docs.openssl.org/3.0/man3/X509_digest/), [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), OpenSSL [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/), SQLite [WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html).
