@@ -16,11 +16,11 @@
 | AddressSanitizer + UndefinedBehaviorSanitizer 빌드/CTest | 3/3 통과 |
 | Agent/Server JSON parser 각각의 CTest | 통과. 숫자 grammar, JSON whitespace, 중복 key, 깊이/크기 제한 포함 |
 | loopback mTLS/policy/queue integration | 통과. event ACK, 동일 내용 dedup, ID 내용 충돌 거부, 미등록 client 거부, policy signature/tamper/replay, offline queue 보존과 server 재시작 후 replay 포함 |
-| HTTP framing 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host, header 초과, 미완성 body timeout 확인 |
+| HTTP framing 및 media-type 음성 통합 | 통과. 중복/잘못된 Content-Length, 초과 body 길이, Transfer-Encoding, POST 길이 누락, HTTP/1.0, GET body, 중복 Host/Content-Type, 누락/잘못된 Content-Type, header 초과, 미완성 body timeout, HTTP 400 ACK 거부와 queue 보존 확인 |
 | Clang 정적 분석 | 두 C++ 프로그램 모두 진단 없음 |
 | smoke script 구문과 `git diff --check` | 통과 |
 
-HTTP framing 시험은 TLS 연결 후 실제 server parser의 400 응답을 확인합니다. header 제한은 16 KiB, body 제한은 1 MiB, accepted socket I/O timeout은 5초입니다. Agent의 정상 ACK 응답 경로도 GCC/Clang 및 sanitizer 통합 시험에 포함됩니다. 별도의 악성 응답을 주는 mock server 행렬은 아직 없습니다.
+HTTP framing 시험은 TLS 연결 후 실제 server parser의 400 응답을 확인합니다. header 제한은 16 KiB, body 제한은 1 MiB, accepted socket I/O timeout은 5초입니다. Agent의 정상 200 ACK와 실제 server의 400 response 거부·queue 보존도 GCC/Clang 및 sanitizer 통합 시험에 포함됩니다. 별도의 mock server status matrix는 아직 없습니다.
 
 ## 실행 재현 명령
 

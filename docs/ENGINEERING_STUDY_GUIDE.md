@@ -29,14 +29,14 @@ GCC와 Clang 21.1.8 Release 빌드, 각 CTest 3/3, ASan/UBSan CTest 3/3, Clang �
 2. `open_queue`가 store 디렉터리 권한을 제한하고 SQLite WAL과 `synchronous=FULL`을 설정합니다. 큐, sequence, 정책 상태 테이블을 준비합니다.
 3. `next_sequence`가 트랜잭션으로 증가된 sequence를 저장합니다. `enqueue`는 고정된 합성 payload를 만들고 hash를 계산한 뒤, 행·바이트 quota를 확인해 네트워크 작업 전에 저장합니다.
 4. `pending`은 sequence 순서로 제한된 batch를 가져옵니다. `send_batch`는 CA, client 인증서, private-key 권한, CN, loopback 주소와 서버 DNS/IP SAN을 검증한 뒤 OpenSSL TLS 연결을 엽니다.
-5. HTTP 요청은 정확한 `Content-Length`를 포함합니다. 응답 파서는 header 16 KiB·body 1 MiB 상한, 단일 `Content-Length`, `Transfer-Encoding` 거부, 완전한 본문 길이를 확인합니다. `ack_ids`는 accepted/duplicate ID를 읽고, `flush`는 실제 전송한 batch ID와 대조한 뒤 일치한 항목만 트랜잭션으로 삭제합니다.
+5. HTTP 요청은 `application/json`과 정확한 `Content-Length`를 포함합니다. 응답 파서는 header 16 KiB·body 1 MiB 상한, 단일 `Content-Length`, `Transfer-Encoding` 거부, HTTP 200 status와 완전한 본문 길이를 확인합니다. 그 외 status는 ACK로 처리하지 않습니다. `ack_ids`는 accepted/duplicate ID를 읽고, `flush`는 실제 전송한 batch ID와 대조한 뒤 일치한 항목만 트랜잭션으로 삭제합니다.
 6. 네트워크·파싱 실패는 bounded exponential backoff와 jitter 뒤 재시도합니다. 서버가 commit하고 ACK가 유실되면 다음 전송은 중복으로 판별됩니다.
 
 ### Server 수신과 ingestion
 
 1. `run_server`는 loopback 이외의 bind를 거부하고, IPv4 loopback listener와 TLS 인증서를 준비합니다.
 2. `accept4(..., SOCK_CLOEXEC)`로 연결을 받고 `serve_one`이 mTLS handshake, CA chain, client 인증서 CN과 allowlist를 확인합니다. 이 구현은 연결을 한 번에 하나씩 처리합니다.
-3. `read_request`는 HTTP/1.1 request line과 header를 제한된 문법으로 읽습니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, POST의 Content-Length, 중복 Content-Length·Transfer-Encoding·GET 본문 거부를 적용합니다. 받은 socket의 read/write timeout은 5초입니다.
+3. `read_request`는 HTTP/1.1 request line과 header를 제한된 문법으로 읽습니다. header는 16 KiB, 본문은 1 MiB까지 허용하며 Host 한 개, batch의 `application/json`, POST의 Content-Length, 중복 Content-Length/Content-Type·Transfer-Encoding·GET 본문 거부를 적용합니다. 받은 socket의 read/write timeout은 5초입니다.
 4. `serve_one`이 health, status, telemetry, heartbeat, policy 경로를 분기합니다. `ingest`는 JSON schema, 주장된 agent ID, 인증서 identity, 이벤트 수, 민감 키, payload hash를 확인합니다.
 5. 서버는 `(agent_id,event_id)` 고유 키로 transaction에 기록하고 commit한 뒤에만 ACK를 보냅니다. 동일 sequence/hash의 재수신은 duplicate, 내용이 바뀐 ID 재사용은 오류가 됩니다.
 

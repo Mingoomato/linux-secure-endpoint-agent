@@ -4,23 +4,23 @@
 
 ## 실습 1 — telemetry의 JSON Content-Type 계약
 
-**목표:** batch endpoint가 JSON 이외의 미디어 타입을 받지 않도록 요청 계약과 회귀 테스트를 추가합니다.
+**목표:** batch endpoint의 미디어 타입 계약을 문서화하고 대소문자와 공백 경계에 대한 회귀 테스트를 추가합니다.
 
 **시작점:** `Request`, `read_request`, `serve_one`, `tests/smoke.sh`.
 
-대소문자를 구분하지 않는 header 이름과 `application/json` media type을 처리하세요. 허용할 공백·parameter 정책을 정하고 문서화한 뒤, 누락/잘못된 Content-Type의 batch가 DB에 기록되지 않는 테스트를 작성하세요.
+현재 코드는 `application/json`만 허용합니다. header 이름과 media type 대소문자 변형, 앞뒤 공백, charset parameter를 테스트하고 어떤 형식을 허용할지 계약으로 정하세요. 필요한 parser 동작과 문서를 구현하고, 누락/잘못된 Content-Type의 batch가 DB에 기록되지 않는 것을 확인하세요.
 
 **완료 기준:** 기존 정상 batch와 동작이 호환되고, 잘못된 미디어 타입이 안전하게 거부되며, DB 상태를 검사하는 통합 테스트가 있습니다.
 
 ## 실습 2 — Agent의 HTTP 응답 상태 처리
 
-**목표:** Agent가 framing과 ACK JSON 외에도 HTTP 성공 상태를 명시적으로 확인하게 합니다.
+**목표:** TLS mock response를 이용해 HTTP status와 ACK JSON의 분리된 검증을 재현합니다.
 
 **시작점:** `http_exchange`, `ack_ids`, `send_batch`, `flush`, loopback TLS test helpers.
 
-정상 ACK, HTTP 400/500, 잘못된 status line, ACK body를 가진 비성공 응답을 재현하세요. 실패 응답에서 로컬 queued event가 지워지지 않는지 확인하세요.
+정상 200 ACK, HTTP 204/400/500, 잘못된 status line, ACK 배열이 들어 있는 비성공 응답을 생성하는 loopback TLS test double을 추가하세요. 각 응답에서 로컬 queued event가 지워지지 않는지 확인하세요.
 
-**완료 기준:** 성공·실패 status의 경계가 코드와 테스트로 설명되고, 비성공 응답을 성공 ACK로 오인하지 않습니다.
+**완료 기준:** 성공·실패 status 경계가 테스트에서 구분되고, 오류 본문에 ACK 배열이 있더라도 비성공 응답으로 큐 항목을 삭제하지 않습니다.
 
 ## 실습 3 — 요청 head parser의 독립 단위 테스트
 

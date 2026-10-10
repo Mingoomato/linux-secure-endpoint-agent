@@ -344,6 +344,9 @@ std::string http_exchange(SSL *ssl, const std::string &request) {
                         status_line.begin() + static_cast<std::ptrdiff_t>(second_space),
                         [](unsigned char c) { return c >= '0' && c <= '9'; }))
                     throw std::runtime_error("SEA_ACK_MALFORMED: invalid HTTP status line");
+                std::string status_code = status_line.substr(first_space + 1U, 3U);
+                if (status_code != "200")
+                    throw std::runtime_error("SEA_HTTP_STATUS: expected 200, received " + status_code);
                 bool found_length = false;
                 std::size_t pos = first_end + 2U;
                 while (pos < headers.size()) {

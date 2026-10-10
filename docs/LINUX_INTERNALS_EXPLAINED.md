@@ -18,7 +18,7 @@ TLS는 전송 중 데이터 보호와 인증을 제공합니다. 정책 발급�
 
 ## HTTP framing과 모호한 메시지 거부
 
-Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subset을 처리합니다. Server는 한 Host, POST Content-Length, decimal-only length를 요구하고 duplicate Content-Length와 모든 Transfer-Encoding을 거부합니다. Agent response parser도 Content-Length 하나만 허용하고 길이 초과/잘림/추가 bytes를 거부합니다.
+Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subset을 처리합니다. Server는 한 Host, batch의 `application/json` Content-Type, POST Content-Length, decimal-only length를 요구하고 duplicate Content-Length/Content-Type과 모든 Transfer-Encoding을 거부합니다. Agent response parser도 Content-Length 하나만 허용하고 정확한 HTTP 200 status가 아닌 응답을 거부하며 길이 초과/잘림/추가 bytes를 검사합니다.
 
 이 정책은 여러 proxy/parser가 같은 byte stream을 다른 길이로 해석하는 상황을 줄이기 위한 것입니다. RFC의 모든 헤더 규칙·상태코드별 body semantics·chunked encoding을 지원하지 않습니다. 그러므로 custom parser를 인터넷 노출 서버에 재사용하면 안 됩니다. 현재 loopback 제한과 테스트는 lab scope의 경계입니다.
 

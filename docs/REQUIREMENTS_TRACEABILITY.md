@@ -19,7 +19,7 @@ The recorded loopback integration and parser tests verify selected mTLS, queue, 
 | SEA-FR-013 | Ed25519 detached signature + scope/expiry | tests/smoke.sh (signature tamper/replay) | IN_PROGRESS |
 | SEA-FR-014 | monotonic revision and last-good DB | SEA-T-009 pending | IN_PROGRESS |
 | SEA-FR-015 | validate then transactional last-good swap | SEA-T-011 pending | IN_PROGRESS |
-| SEA-FR-016 | registry, telemetry, heartbeat, status, health routes; bounded HTTP/1.1 framing | `tests/smoke.sh` route subset + duplicate/invalid/oversized framing rejection | IN_PROGRESS |
+| SEA-FR-016 | registry, telemetry, heartbeat, status, health routes; bounded HTTP/1.1 framing and JSON media type | `tests/smoke.sh` route subset + framing/content-type rejection and non-200 ACK retention | IN_PROGRESS |
 | SEA-FR-017 | synthetic-only event schema; server sensitive-key rejection and strict JSON parsing | parser CTests; SEA-T-012 privacy tests pending | IN_PROGRESS |
 | SEA-FR-018 | systemd units, PID stop, service controls | SEA-T-014 pending | IN_PROGRESS |
 | SEA-FR-019 | logs omit key/token/payload values | source review pending | IN_PROGRESS |

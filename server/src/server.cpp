@@ -24,7 +24,6 @@
 #include <iomanip>
 #include <locale>
 #include <memory>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -148,7 +147,7 @@ std::string trim_http_value(std::string value) {
     return value.substr(first, last - first + 1U);
 }
 
-struct Request { std::string method, path, body; };
+struct Request { std::string method, path, body, content_type; };
 Request read_request(SSL *ssl) {
     std::string raw;
     std::array<char, 8192> buffer {};
@@ -184,6 +183,7 @@ Request read_request(SSL *ssl) {
                     throw std::runtime_error("invalid HTTP request target");
 
                 bool have_length = false;
+                bool have_content_type = false;
                 unsigned host_count = 0;
                 std::size_t pos = first_end + 2U;
                 while (pos < headers.size()) {
@@ -208,6 +208,10 @@ Request read_request(SSL *ssl) {
                         if (have_length) throw std::runtime_error("duplicate Content-Length");
                         body_length = parse_content_length(value);
                         have_length = true;
+                    } else if (normalized == "content-type") {
+                        if (have_content_type) throw std::runtime_error("duplicate Content-Type");
+                        req.content_type = value;
+                        have_content_type = true;
                     } else if (normalized == "transfer-encoding") {
                         throw std::runtime_error("Transfer-Encoding is unsupported");
                     }
@@ -420,6 +424,8 @@ void serve_one(sqlite3 *db, const std::set<std::string> &agents, SSL_CTX *ctx, i
         if (req.path == "/healthz" && req.method == "GET") {
             respond(ssl.get(), 200, "OK", "{\"status\":\"ok\"}");
         } else if (req.path == "/v1/agents/self/events:batch" && req.method == "POST") {
+            if (lowercase_ascii(req.content_type) != "application/json")
+                throw std::runtime_error("event batch requires application/json Content-Type");
             ingest(db, agents, ssl.get(), req, identity);
         } else if (req.path == "/v1/agents/self/heartbeat" && req.method == "POST") {
             respond(ssl.get(), 200, "OK", "{\"schema_version\":\"heartbeat_ack.v1\",\"status\":\"ok\"}");

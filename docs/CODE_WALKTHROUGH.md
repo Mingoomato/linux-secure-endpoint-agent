@@ -12,7 +12,7 @@
 
 `client_context`는 TLS client context를 준비하고 최소 TLS 버전, trust CA, client certificate/private key, key 권한, client identity를 확인합니다. `connect_socket`은 `getaddrinfo` 결과 중 loopback 주소만 연결합니다. `send_batch`는 `SSL_set1_host` 또는 IP 검증 설정 뒤 `SSL_connect`를 수행합니다.
 
-요청은 `/v1/agents/self/events:batch`에 JSON body와 `Content-Length`를 포함합니다. `http_exchange`는 SSL write 전체를 보내고, 상태 줄과 각 header 문법을 확인합니다. 응답 header는 16 KiB, 본문은 1 MiB까지이고 Content-Length는 정확히 하나여야 합니다. 중복 길이, `Transfer-Encoding`, 잘못된 숫자, truncation, 선언 길이를 넘어온 바이트를 거부합니다.
+요청은 `/v1/agents/self/events:batch`에 `application/json` body와 `Content-Length`를 포함합니다. `http_exchange`는 SSL write 전체를 보내고, 상태 줄과 각 header 문법을 확인합니다. 응답 header는 16 KiB, 본문은 1 MiB까지이고 Content-Length는 정확히 하나여야 합니다. 중복 길이, `Transfer-Encoding`, 잘못된 숫자, truncation, 선언 길이를 넘어온 바이트를 거부합니다. 이벤트 ACK는 HTTP 200이어야 하며 다른 status에서는 ID 배열을 처리하지 않습니다.
 
 `ack_ids`는 accepted/duplicate 배열을 JSON으로 파싱합니다. `flush`는 서버가 돌려준 값이 실제 보낸 ID인지 확인하고 확인된 항목만 SQLite transaction에서 제거합니다. 실패하면 남은 queue로 bounded retry를 반복합니다.
 
@@ -22,7 +22,7 @@
 
 `serve_one`은 accepted socket에 5초 receive/send timeout을 설정하고 TLS handshake를 진행합니다. client certificate chain을 확인한 뒤 `peer_cn`의 CN이 allowlist에 있는지 확인합니다. 따라서 mTLS 연결을 맺었다는 것만으로 애플리케이션 권한이 생기지 않습니다.
 
-`read_request`는 제한된 HTTP/1.1 parser입니다. request line은 origin-form path와 HTTP/1.1만 허용합니다. header는 최대 16 KiB, body는 1 MiB이며 Host 한 개를 요구하고 POST에는 단일 Content-Length를 요구합니다. Transfer-Encoding, 중복 Content-Length, GET body, 잘못된 header와 초과 바이트는 처리하지 않습니다.
+`read_request`는 제한된 HTTP/1.1 parser입니다. request line은 origin-form path와 HTTP/1.1만 허용합니다. header는 최대 16 KiB, body는 1 MiB이며 Host 한 개를 요구하고 POST에는 단일 Content-Length를 요구합니다. event batch endpoint는 `application/json` Content-Type 한 개를 확인합니다. Transfer-Encoding, 중복 Content-Length/Content-Type, GET body, 잘못된 header와 초과 바이트는 처리하지 않습니다.
 
 경로 분기 뒤 event batch는 `ingest`로 갑니다. `ingest`가 JSON batch version, 인증서 identity와 body의 agent ID, 이벤트 수, 민감 키, payload hash를 검증합니다. SQLite transaction은 event ID 고유성으로 중복을 잡습니다. 같은 ID의 sequence와 hash가 동일하면 duplicate ACK에 추가하고, 내용이 다르면 rollback/error가 됩니다. DB commit이 끝난 뒤에만 응답을 작성합니다.
 

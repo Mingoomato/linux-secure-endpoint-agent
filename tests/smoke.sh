@@ -122,6 +122,13 @@ expect_400(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1\r\n\r
 expect_400(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: localhost\r\n\r\n")
 expect_400(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: " + b"a" * 17000 + b"\r\n\r\n")
 expect_400(prefix + b"Content-Length: 1\r\n\r\n")
+mime_payload = {"source":"mime-test", "worker_count":1}
+mime_event = {"event_id":"content-type-smoke-event", "sequence":99002, "observed_at":"2026-10-10T00:00:00Z", "kind":"health.heartbeat", "coverage":"healthy", "payload":mime_payload, "payload_hash":hashlib.sha256(json.dumps(mime_payload, separators=(",", ":"), sort_keys=True).encode()).hexdigest()}
+mime_body = json.dumps({"schema_version":"agent_batch.v1", "batch_id":"mime-smoke-batch", "agent_id":agent_id, "events":[mime_event]}, separators=(",", ":")).encode()
+framed_body = b"Content-Length: " + str(len(mime_body)).encode() + b"\r\n\r\n" + mime_body
+expect_400(prefix + framed_body)
+expect_400(prefix + b"Content-Type: text/plain\r\n" + framed_body)
+expect_400(prefix + b"Content-Type: application/json\r\nContent-Type: application/json\r\n" + framed_body)
 PY
 
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$certs/rogue.key" >/dev/null 2>&1
@@ -176,6 +183,33 @@ rc=$?
 set -e
 [ "$rc" -ne 0 ]
 grep -q 'SEA_POLICY_ROLLBACK' "$tmp/policy-replay.out"
+
+# A non-success HTTP status must never be interpreted as an event acknowledgement.
+"$bin_dir/sw-agentd" status --store "$tmp/conflict-agent-store" >/dev/null
+python3 - "$tmp/conflict-agent-store/spool.sqlite" <<'PY'
+import hashlib, json, sqlite3, sys
+payload = {"source":"conflict-test", "worker_count":1}
+payload_text = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+event = {"event_id":"duplicate-smoke-event", "sequence":99002, "observed_at":"2026-10-10T00:00:01Z", "kind":"health.heartbeat", "coverage":"healthy", "payload":payload, "payload_hash":hashlib.sha256(payload_text.encode()).hexdigest()}
+db = sqlite3.connect(sys.argv[1])
+db.execute("insert into queue(event_id,sequence,observed_at,payload,payload_hash) values(?,?,?,?,?)", (event["event_id"], event["sequence"], event["observed_at"], json.dumps(event, separators=(",", ":")), event["payload_hash"]))
+db.commit()
+PY
+set +e
+"$bin_dir/sw-agentd" flush --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/conflict-agent-store" \
+    >"$tmp/conflict-agent.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ]
+grep -q 'SEA_HTTP_STATUS: expected 200, received 400' "$tmp/conflict-agent.log"
+"$bin_dir/sw-agentd" status --store "$tmp/conflict-agent-store" >"$tmp/conflict-status.json"
+python3 - "$tmp/conflict-status.json" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+assert status["queued"] == 1, status
+PY
 
 # Keep an event durable while the server is offline, then deliver it after restart.
 kill "$server_pid"
