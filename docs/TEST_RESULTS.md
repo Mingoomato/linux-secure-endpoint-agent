@@ -3,7 +3,7 @@
 ## 요약
 
 - **구현 상태:** 부분 구현. 이 저장소는 교육용 loopback agent/control server이며 SRS 전체 기능을 구현했다고 주장하지 않습니다.
-- **기술 검증 상태:** GCC/Clang Release·ASan/UBSan 네 구성에서 CTest 4/4 통과. 절대 TLS handshake deadline, policy gate, 그리고 제한된 `event.v1` import의 sample·root-scope·HMAC privacy 경로를 검증했습니다. 실제 monitored-root collector, enrollment/revocation, 장애·성능·배포 행렬 등 SRS 게이트는 미완료입니다.
+- **기술 검증 상태:** 기록된 이전 코드에서 GCC/Clang Release·ASan/UBSan 네 구성의 CTest 4/4가 통과했습니다. 그 뒤 recursive inotify collector, runtime policy refresh/watch replacement 코드를 추가했습니다. 해당 변경은 사용자의 지시에 따라 빌드·테스트·정적 분석을 실행하지 않았으므로 검증 상태에 반영하지 않았습니다. enrollment/revocation, 장애·성능·배포 행렬 등 SRS 게이트도 미완료입니다.
 - **소유자 학습/독립 재현 상태:** 관찰되지 않음. 자동 테스트 성공은 개인 숙련도 증거가 아닙니다.
 
 ## 실행한 검증
@@ -68,8 +68,12 @@ cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 - full HTTP grammar, long-duration parser fuzzing, route-duration deadline, worker pool/동시 연결 부하
 - 추가 event field/profile compatibility matrix, malformed/oversized event fuzzing, key-permission failure, simultaneous key creation/import writer test, 100,000-ID history exhaustion, queue quota·disk-full·DB write failure와 retry/backpressure 429 계약
 - production operator RBAC, certificate enrollment/rotation/revocation and denylist lifecycle
-- `monitored_roots` applied to a real file watcher/collector; current behavior scopes explicit imports only, not automatic collection. Expired stored-policy runtime gating and concurrent update during an in-flight batch also need direct tests.
+- The newly implemented recursive inotify collector and runtime policy refresh/watch replacement have not been built or tested. Also pending: expired-policy runtime behavior and policy change during an in-flight batch.
 - 10k event 처리량, p95/p99, CPU/RSS, 장시간 soak, 여러 배포판/커널 행렬
 - 전체 SRS NFR 검증 및 systemd 설치·실행·권한 경계의 실제 호스트 통합
 
 상세 요구사항별 현황은 [`REQUIREMENTS_TRACEABILITY.md`](REQUIREMENTS_TRACEABILITY.md), 수행 예정인 검증은 [`TEST_PLAN.md`](TEST_PLAN.md), 구현·학습 설명은 [`ENGINEERING_STUDY_GUIDE.md`](ENGINEERING_STUDY_GUIDE.md)를 참고하세요.
+
+## Changes after the last recorded verification
+
+The agent now has code for recursive inotify metadata collection and runtime replacement of the watch set when policy roots or revision change. The user requested implementation work to continue without verification, so no build, test, schema, or static-analysis command has been run after this code change. This report therefore records historical evidence only and does not claim the collector is technically verified.

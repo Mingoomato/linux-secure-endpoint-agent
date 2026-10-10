@@ -10,6 +10,9 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
+#include <poll.h>
+#include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
 #include <algorithm>
@@ -30,6 +33,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <locale>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -996,13 +1000,13 @@ bool sample_rate_admits(const RuntimePolicy &policy) {
 }
 std::optional<std::uint64_t> enqueue_imported_event(sqlite3 *db, const std::string &event_id,
         const std::string &observed, const std::string &kind, const std::string &coverage,
-        const std::string &payload_data) {
+        const std::string &payload_data, bool remember_import = true) {
     const std::string payload_hash = sha256(payload_data);
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
         throw std::runtime_error("event import transaction unavailable");
     try {
         bool duplicate = false;
-        {
+        if (remember_import) {
             ScopedStatement existing;
             sql_check(sqlite3_prepare_v2(db,
                 "SELECT payload_hash FROM imported_events WHERE event_id=?1", -1,
@@ -1022,7 +1026,7 @@ std::optional<std::uint64_t> enqueue_imported_event(sqlite3 *db, const std::stri
                 throw std::runtime_error("event import duplicate commit failed");
             return std::nullopt;
         }
-        {
+        if (remember_import) {
             ScopedStatement count;
             sql_check(sqlite3_prepare_v2(db, "SELECT count(*) FROM imported_events", -1,
                 &count.value, nullptr), db, "import history count prepare");
@@ -1066,7 +1070,7 @@ std::optional<std::uint64_t> enqueue_imported_event(sqlite3 *db, const std::stri
             sql_check(sqlite3_bind_text(insert.value, 5, payload_hash.c_str(), -1, SQLITE_TRANSIENT), db, "event import hash bind");
             sql_check(sqlite3_step(insert.value), db, "event import queue insert");
         }
-        {
+        if (remember_import) {
             ScopedStatement insert;
             sql_check(sqlite3_prepare_v2(db,
                 "INSERT INTO imported_events(event_id,payload_hash) VALUES(?1,?2)", -1,
@@ -1083,6 +1087,361 @@ std::optional<std::uint64_t> enqueue_imported_event(sqlite3 *db, const std::stri
         throw;
     }
 }
+
+Value safe_metadata_number(std::uint64_t value) {
+    constexpr std::uint64_t kMaxJsonSafeInteger = 9007199254740991ULL;
+    if (value > kMaxJsonSafeInteger) return Value{nullptr};
+    return Value{static_cast<double>(value)};
+}
+
+bool enqueue_agent_event(sqlite3 *db, const std::string &store, const RuntimePolicy &policy,
+        const std::string &kind, const std::string &coverage_state,
+        const std::string &coverage_reason, const std::string &path,
+        const std::string &source_event) {
+    if (!policy.present || policy.expired || !policy.telemetry_enabled || !sample_rate_admits(policy))
+        return false;
+
+    Object target;
+    target.emplace("device", Value{nullptr});
+    target.emplace("inode", Value{nullptr});
+    if (!path.empty()) {
+        target.emplace("path", Value{path});
+        struct stat metadata {};
+        if (lstat(path.c_str(), &metadata) == 0) {
+            target["device"] = safe_metadata_number(static_cast<std::uint64_t>(metadata.st_dev));
+            target["inode"] = safe_metadata_number(static_cast<std::uint64_t>(metadata.st_ino));
+        }
+    }
+
+    Object actor;
+    actor.emplace("attribution", Value{std::string("unknown")});
+    actor.emplace("pid", Value{nullptr});
+    actor.emplace("start_time_ticks", Value{nullptr});
+    Object evidence;
+    evidence.emplace("source_event", Value{source_event});
+    Object coverage;
+    coverage.emplace("reason", coverage_reason.empty() ? Value{nullptr} : Value{coverage_reason});
+    coverage.emplace("state", Value{coverage_state});
+    Object event;
+    event.emplace("actor", Value{std::move(actor)});
+    event.emplace("coverage", Value{std::move(coverage)});
+    event.emplace("evidence", Value{std::move(evidence)});
+    event.emplace("event_id", Value{uuid()});
+    event.emplace("kind", Value{kind});
+    event.emplace("observed_at", Value{now_iso()});
+    event.emplace("schema_version", Value{std::string("event.v1")});
+    event.emplace("severity", Value{coverage_state == "healthy" ? std::string("info") : std::string("warning")});
+    event.emplace("source", Value{std::string("sea")});
+    event.emplace("target", Value{std::move(target)});
+
+    std::string event_id, observed, normalized_kind, normalized_coverage;
+    const Value normalized = normalize_imported_event(Value{std::move(event)}, store, policy,
+        event_id, observed, normalized_kind, normalized_coverage);
+    const auto sequence = enqueue_imported_event(db, event_id, observed, normalized_kind,
+        normalized_coverage, canonical_json(normalized), false);
+    return sequence.has_value();
+}
+
+class InotifyCollector {
+    struct Root {
+        std::filesystem::path path;
+        dev_t device = 0;
+    };
+    int fd_ = -1;
+    std::string store_;
+    std::vector<Root> roots_;
+    std::map<int, std::filesystem::path> watches_;
+    bool degraded_ = false;
+    bool coverage_reported_ = false;
+    std::chrono::steady_clock::time_point coverage_retry_after_{};
+    std::string degraded_reason_ = "watch_unavailable";
+    static constexpr std::size_t kMaxWatchedDirectories = 4096U;
+
+    int open_directory_without_symlinks(const std::filesystem::path &path) const {
+        if (!path.is_absolute()) throw std::runtime_error("collector path must be absolute");
+        int directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory < 0) throw std::runtime_error("collector root cannot be opened");
+        for (const auto &component : path.relative_path()) {
+            const std::string name = component.string();
+            if (name.empty() || name == ".") continue;
+            if (name == "..") {
+                close(directory);
+                throw std::runtime_error("collector path traversal rejected");
+            }
+            const int next = openat(directory, name.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            const int saved_errno = errno;
+            close(directory);
+            if (next < 0) {
+                errno = saved_errno;
+                throw std::runtime_error("collector directory is unavailable or changed");
+            }
+            directory = next;
+        }
+        return directory;
+    }
+
+    const Root *root_for(const std::filesystem::path &path) const {
+        const Root *best = nullptr;
+        for (const auto &root : roots_) {
+            if (path_is_within(path, root.path) &&
+                (!best || root.path.native().size() > best->path.native().size())) best = &root;
+        }
+        return best;
+    }
+
+    void add_directory_tree(int directory, const std::filesystem::path &display_path,
+                            dev_t root_device) {
+        if (watches_.size() >= kMaxWatchedDirectories)
+            throw std::runtime_error("collector directory watch limit reached");
+        const std::string proc_path = "/proc/self/fd/" + std::to_string(directory);
+        std::error_code path_error;
+        const auto actual_path = std::filesystem::canonical(proc_path, path_error);
+        const Root *root = path_error ? nullptr : root_for(actual_path);
+        struct stat metadata {};
+        if (path_error || !root || root->device != root_device ||
+            fstat(directory, &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
+            metadata.st_dev != root_device)
+            throw std::runtime_error("collector directory escaped its policy root");
+
+        const int watch = inotify_add_watch(fd_, proc_path.c_str(),
+            IN_CREATE | IN_CLOSE_WRITE | IN_ATTRIB | IN_DELETE | IN_MOVED_FROM |
+            IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT | IN_ONLYDIR);
+        if (watch < 0) throw std::runtime_error("collector watch cannot be installed");
+        watches_[watch] = actual_path;
+
+        const int scan_fd = dup(directory);
+        if (scan_fd < 0) throw std::runtime_error("collector directory scan cannot start");
+        DIR *stream = fdopendir(scan_fd);
+        if (!stream) {
+            close(scan_fd);
+            throw std::runtime_error("collector directory scan cannot start");
+        }
+        errno = 0;
+        while (dirent *entry = readdir(stream)) {
+            const std::string name(entry->d_name);
+            if (name == "." || name == "..") continue;
+            struct stat child_metadata {};
+            if (fstatat(directory, name.c_str(), &child_metadata, AT_SYMLINK_NOFOLLOW) != 0) {
+                degraded_ = true;
+                degraded_reason_ = "directory_entry_unavailable";
+                errno = 0;
+                continue;
+            }
+            if (!S_ISDIR(child_metadata.st_mode) || child_metadata.st_dev != root_device) continue;
+            const int child = openat(directory, name.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child < 0) {
+                degraded_ = true;
+                degraded_reason_ = "directory_changed_during_scan";
+                errno = 0;
+                continue;
+            }
+            try {
+                add_directory_tree(child, actual_path / name, root_device);
+            } catch (...) {
+                close(child);
+                closedir(stream);
+                throw;
+            }
+            close(child);
+            errno = 0;
+        }
+        const int scan_error = errno;
+        closedir(stream);
+        if (scan_error != 0) throw std::runtime_error("collector directory enumeration failed");
+        (void)display_path;
+    }
+
+    bool rebuild() {
+        for (const auto &[watch, path] : watches_) {
+            (void)path;
+            (void)inotify_rm_watch(fd_, watch);
+        }
+        watches_.clear();
+        bool complete = true;
+        for (const auto &root : roots_) {
+            int directory = -1;
+            try {
+                directory = open_directory_without_symlinks(root.path);
+                add_directory_tree(directory, root.path, root.device);
+                close(directory);
+            } catch (...) {
+                if (directory >= 0) close(directory);
+                complete = false;
+                degraded_ = true;
+                degraded_reason_ = "root_or_subdirectory_unavailable";
+            }
+        }
+        if (watches_.empty()) {
+            complete = false;
+            degraded_ = true;
+            degraded_reason_ = roots_.empty() ? "no_monitored_roots" : "no_active_watches";
+        }
+        return complete;
+    }
+
+    void report_degraded(sqlite3 *db, const RuntimePolicy &policy) {
+        if (!degraded_ || coverage_reported_) return;
+        if (std::chrono::steady_clock::now() < coverage_retry_after_) return;
+        try {
+            (void)enqueue_agent_event(db, store_, policy, "coverage.watch_degraded", "degraded",
+                degraded_reason_, {}, "INOTIFY_COVERAGE_GAP");
+            coverage_reported_ = true;
+        } catch (const std::exception &error) {
+            coverage_retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            std::cerr << "collector coverage report deferred: " << error.what() << '\n';
+        }
+    }
+
+    void process_file_event(sqlite3 *db, const RuntimePolicy &policy,
+                            const std::filesystem::path &path, const char *kind,
+                            const char *source_event) {
+        try {
+            (void)enqueue_agent_event(db, store_, policy, kind, "healthy", {}, path.string(), source_event);
+        } catch (const std::exception &error) {
+            if (std::string(error.what()).find("SEA_QUEUE_FULL") != std::string::npos) {
+                degraded_ = true;
+                degraded_reason_ = "queue_backpressure";
+            } else {
+                std::cerr << "collector event deferred: " << error.what() << '\n';
+            }
+        }
+    }
+
+public:
+    InotifyCollector(const std::string &store, const RuntimePolicy &policy) : store_(store) {
+        fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (fd_ < 0) throw std::runtime_error("inotify initialization failed");
+        for (const auto &root_path : policy.monitored_roots) {
+            try {
+                const int directory = open_directory_without_symlinks(root_path);
+                struct stat metadata {};
+                if (fstat(directory, &metadata) != 0 || !S_ISDIR(metadata.st_mode)) {
+                    close(directory);
+                    throw std::runtime_error("collector root is unavailable");
+                }
+                roots_.push_back(Root{root_path, metadata.st_dev});
+                close(directory);
+            } catch (...) {
+                degraded_ = true;
+                degraded_reason_ = "root_unavailable";
+            }
+        }
+        if (roots_.size() != policy.monitored_roots.size()) degraded_ = true;
+        if (!rebuild() && degraded_reason_ == "watch_unavailable")
+            degraded_reason_ = "root_or_subdirectory_unavailable";
+    }
+    ~InotifyCollector() {
+        if (fd_ >= 0) close(fd_);
+    }
+    InotifyCollector(const InotifyCollector &) = delete;
+    InotifyCollector &operator=(const InotifyCollector &) = delete;
+
+    void poll_once(sqlite3 *db, const RuntimePolicy &policy, int timeout_ms) {
+        report_degraded(db, policy);
+        pollfd descriptor{fd_, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, timeout_ms);
+        if (ready < 0) {
+            if (errno == EINTR) return;
+            degraded_ = true;
+            degraded_reason_ = "inotify_poll_failed";
+            report_degraded(db, policy);
+            return;
+        }
+        if (ready == 0) return;
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            degraded_ = true;
+            degraded_reason_ = "inotify_descriptor_failed";
+            report_degraded(db, policy);
+            return;
+        }
+        alignas(inotify_event) std::array<char, 64U * 1024U> buffer{};
+        bool must_rebuild = false;
+        for (;;) {
+            const ssize_t length = read(fd_, buffer.data(), buffer.size());
+            if (length < 0 && errno == EINTR) continue;
+            if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (length <= 0) {
+                degraded_ = true;
+                degraded_reason_ = "inotify_read_failed";
+                break;
+            }
+            std::size_t offset = 0;
+            while (offset + sizeof(inotify_event) <= static_cast<std::size_t>(length)) {
+                const auto *event = reinterpret_cast<const inotify_event *>(buffer.data() + offset);
+                const std::size_t event_size = sizeof(inotify_event) + event->len;
+                if (event_size > static_cast<std::size_t>(length) - offset) {
+                    degraded_ = true;
+                    degraded_reason_ = "inotify_record_malformed";
+                    break;
+                }
+                offset += event_size;
+                if ((event->mask & IN_Q_OVERFLOW) != 0) {
+                    degraded_ = true;
+                    degraded_reason_ = "inotify_queue_overflow";
+                    must_rebuild = true;
+                    continue;
+                }
+                const auto watch_it = watches_.find(event->wd);
+                if (watch_it == watches_.end()) continue;
+                const std::filesystem::path parent = watch_it->second;
+                if ((event->mask & IN_IGNORED) != 0) {
+                    watches_.erase(watch_it);
+                    continue;
+                }
+                if ((event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT)) != 0) {
+                    degraded_ = true;
+                    degraded_reason_ = "watched_directory_moved_or_removed";
+                    must_rebuild = true;
+                    continue;
+                }
+                if (event->len == 0U || event->name[0] == '\0') continue;
+                const std::filesystem::path changed = parent / event->name;
+                if ((event->mask & (IN_CREATE | IN_MOVED_TO)) != 0 &&
+                    (event->mask & IN_ISDIR) != 0) {
+                    try {
+                        const Root *root = root_for(parent);
+                        if (!root) throw std::runtime_error("collector directory outside policy roots");
+                        int directory = open_directory_without_symlinks(changed);
+                        try {
+                            add_directory_tree(directory, changed, root->device);
+                            close(directory);
+                        } catch (...) {
+                            close(directory);
+                            throw;
+                        }
+                    } catch (...) {
+                        degraded_ = true;
+                        degraded_reason_ = "new_directory_watch_failed";
+                    }
+                    continue;
+                }
+                const struct {
+                    std::uint32_t mask;
+                    const char *kind;
+                    const char *source;
+                } mappings[] = {
+                    {IN_CREATE, "file.created", "IN_CREATE"},
+                    {IN_CLOSE_WRITE, "file.modified", "IN_CLOSE_WRITE"},
+                    {IN_ATTRIB, "file.metadata_changed", "IN_ATTRIB"},
+                    {IN_DELETE, "file.deleted", "IN_DELETE"},
+                    {IN_MOVED_FROM, "file.moved_from", "IN_MOVED_FROM"},
+                    {IN_MOVED_TO, "file.moved_to", "IN_MOVED_TO"}
+                };
+                for (const auto &mapping : mappings) {
+                    if ((event->mask & mapping.mask) != 0) {
+                        process_file_event(db, policy, changed, mapping.kind, mapping.source);
+                        break;
+                    }
+                }
+            }
+        }
+        if (must_rebuild) (void)rebuild();
+        report_degraded(db, policy);
+    }
+};
+
 int import_event(const Config &config, const std::string &file) {
     if (file.empty()) throw std::runtime_error("import-event requires --file");
     std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(config.store), sqlite3_close);
@@ -1374,8 +1733,9 @@ int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
             std::cout << "sw-agentd enroll|run|status|doctor|flush|import-event|sync-policy|validate-policy|stop [options]\n"
-                         "TLS options: --endpoint HOST --port PORT --agent-id UUID --ca FILE --cert FILE --key FILE\n"
-                         "Storage: --store DIR; policy: --file JSON --signature RAW64 --pubkey PEM --tenant ID --root ABS\n";
+                          "TLS options: --endpoint HOST --port PORT --agent-id UUID --ca FILE --cert FILE --key FILE\n"
+                          "Storage: --store DIR; policy: --file JSON --signature RAW64 --pubkey PEM --tenant ID --root ABS\n"
+                          "Long-running run: --interval-seconds N enables policy-root inotify collection; --policy-sync-interval-seconds N refreshes signed policy\n";
             return argc < 2 ? 2 : 0;
         }
         std::string command = argv[1];
@@ -1438,21 +1798,105 @@ int main(int argc, char **argv) {
         if (command != "flush" && command != "run") throw std::runtime_error("unknown command");
         std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(open_queue(c.store), sqlite3_close);
         sqlite3 *db = database.get();
-        if (command == "run" || flag(argc, argv, "--synthetic"))
-            (void)enqueue_synthetic_if_enabled(db, c.tenant);
         signal(SIGINT, stop_signal); signal(SIGTERM, stop_signal);
         std::string pidfile = arg(argc, argv, "--pidfile");
         if (command == "run" && !pidfile.empty()) write_pidfile(pidfile);
         int interval = std::stoi(arg(argc, argv, "--interval-seconds", "0"));
         if (interval < 0 || interval > 86400) throw std::runtime_error("interval out of range");
         int rc = 0;
-        do {
+        if (command == "run" && interval > 0) {
+            const std::string pubfile = arg(argc, argv, "--pubkey");
+            const std::string allowed_root = arg(argc, argv, "--root");
+            const std::string sync_default = pubfile.empty() ? "0" : "60";
+            int sync_interval = std::stoi(arg(argc, argv, "--policy-sync-interval-seconds", sync_default));
+            if (sync_interval < 0 || sync_interval > 86400)
+                throw std::runtime_error("policy sync interval out of range");
+            if (!pubfile.empty() && allowed_root.empty())
+                throw std::runtime_error("--root is required when --pubkey is configured");
+            if (sync_interval > 0 && pubfile.empty())
+                throw std::runtime_error("--pubkey is required for periodic policy sync");
+
+            if (!pubfile.empty()) {
+                try {
+                    fetch_and_validate_policy(c, pubfile, c.tenant, allowed_root);
+                } catch (const std::exception &error) {
+                    std::cerr << "policy sync deferred; last-good policy remains active: "
+                              << error.what() << '\n';
+                }
+            }
+
+            RuntimePolicy current_policy = active_policy(db, c.tenant, false);
+            auto should_watch = [](const RuntimePolicy &policy) {
+                return policy.present && !policy.expired && policy.telemetry_enabled &&
+                    policy.sample_rate > 0.0 && !policy.monitored_roots.empty();
+            };
+            std::unique_ptr<InotifyCollector> collector;
+            if (should_watch(current_policy))
+                collector = std::make_unique<InotifyCollector>(c.store, current_policy);
+            (void)enqueue_synthetic_if_enabled(db, c.tenant);
             rc = flush(db, c);
-            if (interval == 0 || stopping) break;
-            for (int i = 0; i < interval && !stopping; ++i)
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (!stopping) (void)enqueue_synthetic_if_enabled(db, c.tenant);
-        } while (!stopping);
+
+            using Clock = std::chrono::steady_clock;
+            const auto flush_delay = std::chrono::seconds(interval);
+            const auto sync_delay = std::chrono::seconds(sync_interval);
+            auto next_flush = Clock::now() + flush_delay;
+            auto next_heartbeat = next_flush;
+            auto next_policy_sync = sync_interval > 0 ? Clock::now() + sync_delay : Clock::time_point::max();
+            while (!stopping) {
+                auto now = Clock::now();
+                if (sync_interval > 0 && now >= next_policy_sync) {
+                    try {
+                        fetch_and_validate_policy(c, pubfile, c.tenant, allowed_root);
+                    } catch (const std::exception &error) {
+                        std::cerr << "policy sync deferred; last-good policy remains active: "
+                                  << error.what() << '\n';
+                    }
+                    next_policy_sync = Clock::now() + sync_delay;
+                }
+
+                RuntimePolicy refreshed = active_policy(db, c.tenant, false);
+                const bool policy_changed = refreshed.revision != current_policy.revision ||
+                    refreshed.present != current_policy.present || refreshed.expired != current_policy.expired ||
+                    refreshed.telemetry_enabled != current_policy.telemetry_enabled ||
+                    refreshed.sample_rate != current_policy.sample_rate ||
+                    refreshed.monitored_roots != current_policy.monitored_roots;
+                if (policy_changed) {
+                    collector.reset();
+                    current_policy = std::move(refreshed);
+                    if (should_watch(current_policy))
+                        collector = std::make_unique<InotifyCollector>(c.store, current_policy);
+                }
+
+                const auto before_poll = Clock::now();
+                auto wake_at = std::min(next_flush, next_heartbeat);
+                wake_at = std::min(wake_at, next_policy_sync);
+                const auto remaining = wake_at > before_poll ?
+                    std::chrono::duration_cast<std::chrono::milliseconds>(wake_at - before_poll).count() : 0;
+                const int wait_ms = static_cast<int>(std::min<std::int64_t>(250, std::max<std::int64_t>(0, remaining)));
+                if (collector) collector->poll_once(db, current_policy, wait_ms);
+                else std::this_thread::sleep_for(std::chrono::milliseconds(std::max(wait_ms, 1)));
+
+                now = Clock::now();
+                if (now >= next_heartbeat) {
+                    (void)enqueue_synthetic_if_enabled(db, c.tenant);
+                    next_heartbeat = now + flush_delay;
+                }
+                if (now >= next_flush) {
+                    rc = flush(db, c);
+                    next_flush = now + flush_delay;
+                }
+            }
+        } else {
+            if (command == "run" || flag(argc, argv, "--synthetic"))
+                (void)enqueue_synthetic_if_enabled(db, c.tenant);
+            do {
+                rc = flush(db, c);
+                if (interval == 0 || stopping) break;
+                for (int i = 0; i < interval && !stopping; ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (!stopping) (void)enqueue_synthetic_if_enabled(db, c.tenant);
+            } while (!stopping);
+        }
         if (!pidfile.empty()) unlink(pidfile.c_str());
         return rc;
     } catch (const std::exception &e) {

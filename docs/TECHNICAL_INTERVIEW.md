@@ -94,4 +94,16 @@ Owner mastery는 직접 완료한 실습과 근거를 제시하는 방어 답변
 67. key file 생성 중 다른 process가 먼저 해당 파일을 열면 어떤 상태가 가능하며, 현재 구현은 이를 어떻게 실패 처리하나요? 동시 import 시험에서 어떤 race를 확인해야 하나요?
 68. per-store HMAC이 같은 경로를 안정적으로 연결하는 장점과 store 복제·key rotation 때 생기는 privacy tradeoff를 설명하세요. per-event nonce나 암호화된 path 보관과 비교해 보세요.
 
-공식 참고: Linux [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), OpenSSL [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/), SQLite [WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html).
+
+## inotify collector와 runtime policy 적용
+
+69. `InotifyCollector::open_directory_without_symlinks`가 root부터 각 경로 component를 여는 방식을 설명하세요. `O_NOFOLLOW`와 descriptor-relative `openat`가 줄이는 race와 남는 mount/namespace 한계는 무엇인가요?
+70. `inotify_add_watch`에 `/proc/self/fd/N`을 전달하는 이유는 무엇이며, 디렉터리 FD를 닫은 뒤 watch 수명은 어떻게 되나요?
+71. collector가 `IN_CLOSE_WRITE`를 `file.modified`로 기록해도 파일 내용의 안정성이나 무결성을 증명하지 못하는 이유는 무엇인가요?
+72. inotify queue overflow에서 어떤 정보가 손실되나요? Watch tree를 재구성한 뒤에도 coverage를 degraded로 유지해야 하는 이유를 설명하세요.
+73. 장기 `run --interval-seconds N`과 기본 one-shot `run`의 동작 차이를 설명하세요. `--policy-sync-interval-seconds`는 offline last-good 동작과 어떻게 맞물리나요?
+74. policy revision이 바뀌어 watched roots가 교체될 때 이전 inotify FD, watch descriptors, queued notifications의 수명과 처리 순서를 설명하세요.
+75. Collector가 다른 `st_dev`의 하위 디렉터리를 건너뛰는 이유와 같은 device의 bind mount에 대한 잔여 위험을 설명하세요.
+76. Queue quota가 찼을 때 collector는 어떤 coverage 상태로 전환하나요? coverage 이벤트를 큐에 넣을 수 없는 경우 운영자에게 이를 전달할 다른 경로는 무엇인가요?
+
+공식 참고: Linux [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), OpenSSL [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/), SQLite [WAL](https://www.sqlite.org/wal.html) and [Atomic Commit](https://www.sqlite.org/atomiccommit.html).

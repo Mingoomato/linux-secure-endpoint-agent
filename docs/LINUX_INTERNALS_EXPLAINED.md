@@ -46,7 +46,7 @@ Server와 Agent는 full HTTP implementation이 아니라 제한된 HTTP/1.1 subs
 
 합성 이벤트 생성 경로는 `telemetry_enabled`가 false이거나 정책이 만료되면 새 이벤트를 저장하지 않습니다. `sample_rate`가 0이면 이벤트를 만들지 않고, 1이면 모두 만들며, 중간값이면 `RAND_bytes`가 제공한 64 random bit 중 상위 53 bit를 [0, 1) 범위 표본으로 사용해 설정 비율과 비교합니다. OpenSSL random API가 실패하면 표본을 추측해 계속하지 않고 오류 처리합니다. 표본 통과 후에만 sequence 증가·UUID 생성·SQLite enqueue를 진행하므로 제외된 샘플은 queue 용량을 차지하지 않습니다.
 
-`flush`는 각 전송 batch 전에 정책을 다시 읽습니다. 정책이 없거나 stale/telemetry-disabled이면 전송을 멈추고 기존 queue row를 유지합니다. `sample_rate=0`은 생성만 제어하므로 telemetry가 활성 상태면 기존 queue를 전송할 수 있습니다. 이미 네트워크 요청을 시작한 batch는 뒤에서 정책이 바뀌어도 취소되지 않습니다. `status`는 `NO_POLICY`, `STALE`, `ACTIVE`, `VALIDATED`와 revision, telemetry flag, sample rate, monitored root 수, queue 크기를 보여줍니다. root 값은 서명 정책에서 검증·보관되지만 이 저장소에는 실제 파일 watcher가 없습니다.
+`flush`는 각 전송 batch 전에 정책을 다시 읽습니다. 정책이 없거나 stale/telemetry-disabled이면 전송을 멈추고 기존 queue row를 유지합니다. `sample_rate=0`은 생성만 제어하므로 telemetry가 활성 상태면 기존 queue를 전송할 수 있습니다. 이미 네트워크 요청을 시작한 batch는 뒤에서 정책이 바뀌어도 취소되지 않습니다. `status`는 `NO_POLICY`, `STALE`, `ACTIVE`, `VALIDATED`와 revision, telemetry flag, sample rate, monitored root 수, queue 크기를 보여줍니다. 장기 `run`은 active monitored roots를 재귀 inotify watch로 적용하며 변경은 event.v1 metadata event가 됩니다. collector 추가 이후의 빌드와 실행 검증은 하지 않았습니다.
 
 ## SQLite transaction과 ACK 의미
 
@@ -64,19 +64,29 @@ Sequence 증가와 event 삽입은 별도 transaction이라 crash 후 sequence g
 
 정책의 monitored root를 사용자 입력 문자열의 접두사 비교만으로 제한하면 안 됩니다. `..` 구성 요소는 allowlist prefix가 문자열에 남아 있어도 다른 디렉터리를 가리킬 수 있고, 심볼릭 링크는 겉으로 보이는 위치와 실제 대상을 분리합니다. Agent는 설정된 허용 디렉터리와 각 요청 경로를 `std::filesystem::canonical`로 정규화해 기존 디렉터리 여부를 확인한 다음 경로 구성 요소를 비교합니다. `/safe/root2`는 `/safe/root`의 하위 경로가 아니므로 텍스트 prefix가 아니라 component 경계가 중요합니다.
 
-정책 sync는 정책 root를 last-good DB에 저장하기 전에 검사하고, `import-event`는 가져온 이벤트 경로를 다시 검사합니다. 현재 실제 파일 watcher가 없어 자동 파일을 열거나 수집하지는 않습니다. Importer의 약한 canonicalization은 root scope에 제한된 pseudonym을 만들기 위한 metadata 검사일 뿐 descriptor 권한 검사가 아닙니다. 실제 감시를 추가할 때는 디렉터리 FD 기준 접근이나 Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS` 같은 제약을 검토해 검사와 open 사이의 TOCTOU를 줄여야 합니다.
+정책 sync는 정책 root를 last-good DB에 저장하기 전에 검사하고, `import-event`는 가져온 이벤트 경로를 다시 검사합니다. 장기 `run` collector는 파일 내용을 읽지 않고 directory notification과 제한된 stat metadata만 수집합니다. Collector는 component별 `openat(O_NOFOLLOW)`로 directory FD를 확보한 뒤 watch를 설치하고, importer는 경로를 HMAC pseudonym으로 바꿉니다. 이 조합은 symlink traversal을 줄이지만 모든 mount/namespace race를 막는 descriptor policy가 아닙니다. Linux `openat2(2)`의 `RESOLVE_BENEATH`·`RESOLVE_NO_SYMLINKS`는 더 강한 path resolution을 제공하는 대안입니다.
 
 ## systemd와 프로세스 경계
 
 예제 unit은 전용 사용자, `NoNewPrivileges`, 제한된 파일시스템 view, private temporary directory, 명시 writable 경로를 보여줍니다. 실제 설치·사용자 생성·key provisioning·uninstall은 구현되지 않았습니다. service sandbox는 TLS와 애플리케이션 인증 대신 사용할 수 없습니다.
 
+## inotify collector의 syscall 흐름
+
+`inotify_init1(IN_NONBLOCK | IN_CLOEXEC)`는 daemon이 소유할 FD 하나를 만들고, `inotify_add_watch`는 디렉터리별 create/close-write/attribute/delete/move mask를 등록합니다. 파일마다 FD를 열지 않습니다. `poll`은 250ms 이하로 readiness를 기다리고, `read`는 커널이 만든 `inotify_event` 레코드 배열을 비운 뒤 mask별 이벤트를 구분합니다. `IN_Q_OVERFLOW`는 어느 경로 이벤트가 빠졌는지 알 수 없으므로 degraded coverage로 취급합니다.
+
+Tree traversal은 root에서 시작해 `openat(parent_fd, name, O_DIRECTORY|O_NOFOLLOW)`로 하위 디렉터리를 엽니다. `fstatat(..., AT_SYMLINK_NOFOLLOW)`는 symlink directory를 따라가지 않게 하고, `fdopendir(dup(fd))`/`readdir`는 이름 목록만 조회합니다. `inotify_add_watch`가 pathname 인자를 받으므로 `/proc/self/fd/N`을 사용해 이미 열린 directory object에 watch를 붙입니다. `fstat`의 `st_dev`가 root와 다른 하위 directory는 넘어갑니다. 이 방식도 mount namespace나 같은 device의 bind mount 경계를 완전하게 식별하지는 않습니다.
+
+`InotifyCollector`는 장기 inotify FD와 watch descriptor map을 소유합니다. 루트 traversal의 각 FD는 즉시 닫히고, `DIR*`는 `closedir`가 닫습니다. 신호는 `sig_atomic_t` 종료 flag를 세워 poll loop가 자원을 정상 정리하도록 합니다. 하나의 event loop가 inotify 알림, SQLite transaction, queue flush를 처리하므로 이 구현에는 collector worker thread 경쟁이 없습니다.
+
+알림은 파일 내용을 증명하지 않습니다. `IN_CLOSE_WRITE`는 write access가 닫혔다는 신호일 뿐, 내용이 안정됐거나 악성임을 의미하지 않습니다. Rename은 source와 destination directory에서 각각 보고될 수 있고 cookie로 쌍을 이루어야 한다는 제약이 남아 있습니다. Overflow 뒤에는 현재 디렉터리를 다시 watch하지만 놓친 변화의 history를 복구할 baseline scan은 하지 않으므로 degraded coverage를 유지합니다. 정확한 상태 복구가 필요하면 baseline/hash를 가진 FIM subsystem이나 fanotify 기반 설계를 따로 검토해야 합니다.
+
 ## 공식 문서
 
 - Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`setsockopt(2)`](https://man7.org/linux/man-pages/man2/setsockopt.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html), [`close(2)`](https://man7.org/linux/man-pages/man2/close.2.html)
-- Linux man-pages: [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html), [`write(2)`](https://man7.org/linux/man-pages/man2/write.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`fstat(2)`](https://man7.org/linux/man-pages/man2/fstat.2.html)
+- Linux man-pages: [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html), [`write(2)`](https://man7.org/linux/man-pages/man2/write.2.html), [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html), [`fstat(2)`](https://man7.org/linux/man-pages/man2/fstat.2.html), [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`fstatat(2)`](https://man7.org/linux/man-pages/man2/fstatat.2.html), [`fdopendir(3)`](https://man7.org/linux/man-pages/man3/fdopendir.3.html), [`readdir(3)`](https://man7.org/linux/man-pages/man3/readdir.3.html)
 - Linux path resolution: [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`realpath(3)`](https://man7.org/linux/man-pages/man3/realpath.3.html)
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_accept`](https://docs.openssl.org/3.0/man3/SSL_accept/), [`SSL_get_error`](https://docs.openssl.org/3.0/man3/SSL_get_error/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
-- Linux man-pages: [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html)
+- Linux man-pages: [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), [`inotify_init1(2)`](https://man7.org/linux/man-pages/man2/inotify_init1.2.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html)
 - OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
 - OpenSSL keyed digest API: [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/)
 - IETF: [RFC 9112 — HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), [RFC 8259 — JSON](https://www.rfc-editor.org/rfc/rfc8259)

@@ -2,9 +2,9 @@
 
 ## 학습 목표와 현재 상태
 
-이 저장소는 합성 상태 이벤트와 사용자가 명시적으로 전달한 단일 `event.v1` 레코드를 loopback control server로 보내는 교육용 endpoint agent입니다. durable queue, mTLS, Ed25519 정책, 제한된 관리자 API를 함께 구현해 transport 인증·정책 발급자 인증·재전송·최소 수집 경계를 학습하도록 제작했습니다. `import-event`는 이벤트 문서만 읽고 대상 파일은 열지 않으며, 정책 root를 검사한 뒤 경로를 HMAC 가명화합니다. 자동 파일 감시, 개인 파일 내용 수집, 임의 명령 실행 기능은 없습니다.
+이 저장소는 합성 상태 이벤트, 수동 event.v1 import, 장기 실행 모드의 inotify metadata collector를 loopback control server로 보내는 교육용 endpoint agent입니다. durable queue, mTLS, Ed25519 정책, 제한된 관리자 API를 함께 구현해 transport 인증·정책 발급자 인증·재전송·최소 수집 경계를 학습하도록 제작했습니다. 수동 import와 collector는 활성 root를 검사하고 경로를 HMAC 가명화하며, file content나 임의 명령을 수집·실행하지 않습니다.
 
-GCC Release, Clang Release, GCC ASan/UBSan, Clang ASan/UBSan 네 구성에서 CTest가 각각 4/4 통과했고 변경된 agent Clang 정적 분석도 진단이 없었습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구, no-policy 차단, telemetry 비활성 큐 보존, sample rate 적용을 확인합니다. 추가로 `event.v1` 입력은 활성 정책 root 안의 경로만 받아 HMAC ID로 바꾸고, sample suppression, 중복, pathless degraded coverage와 unknown/sensitive field 거부를 확인합니다. Smoke는 target file marker가 spool에 들어가지 않으며 server ACK까지 연결됨을 확인합니다. 그 외 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision, 1초 TLS handshake deadline 아래 incomplete ClientHello와 1.5초 HTTP request deadline 아래 slow-client 종료를 시험합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. 자동 file watcher, production enrollment/revocation/RBAC, malformed/import key fault·경합·history exhaustion, 확장 restart/offline/expiry 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
+수집기 추가 직전 기록된 GCC/Clang Release와 GCC/Clang ASan/UBSan 네 구성에서 CTest가 각각 4/4 통과했고 해당 코드의 agent Clang 정적 분석도 진단이 없었습니다. 정책 시험은 operator 인증 분리, 게시·서명, 조건부 304 fetch, agent sync, 잘못된 higher revision 거부 후 last-good 보존과 뒤이은 valid revision 복구, no-policy 차단, telemetry 비활성 큐 보존, sample rate 적용을 확인합니다. 추가로 `event.v1` 입력은 활성 정책 root 안의 경로만 받아 HMAC ID로 바꾸고, sample suppression, 중복, pathless degraded coverage와 unknown/sensitive field 거부를 확인합니다. Smoke는 target file marker가 spool에 들어가지 않으며 server ACK까지 연결됨을 확인합니다. 그 외 `..` 경로, 외부 symlink, 달력상 유효하지 않은 만료일, 음수·소수·안전 범위 초과 revision, 1초 TLS handshake deadline 아래 incomplete ClientHello와 1.5초 HTTP request deadline 아래 slow-client 종료를 시험합니다. 분리한 HTTP request parser는 seed 입력 기반 Clang libFuzzer+ASan+UBSan 100,000회 실행에서도 실패를 찾지 못했습니다. 이는 선택한 로컬 경로의 자동 검증 결과이며, 전체 HTTP grammar나 장시간 fuzz 안전성을 증명하지 않습니다. 전체 SRS는 부분 구현 상태입니다. inotify collector와 runtime policy reload는 코드에 추가됐지만 새 변경 뒤 빌드·검증을 수행하지 않았습니다. Overflow 뒤 baseline reconciliation, rename cookie pairing, production enrollment/revocation/RBAC, import key fault·경합·history exhaustion, 확장 restart/offline/expiry 행렬, quota/disk fault, 성능 행렬은 아직 완결되지 않았습니다. 저장소 소유자의 학습·독립 재현 여부도 관찰되지 않았으며, 자동 빌드 성공은 개인 숙련도의 증거가 아닙니다.
 
 ## 각 하위 시스템이 필요한 이유
 
@@ -12,6 +12,7 @@ GCC Release, Clang Release, GCC ASan/UBSan, Clang ASan/UBSan 네 구성에서 CT
 |---|---|---|
 | 합성 이벤트 생성 | 실제 파일이나 사용자 데이터 없이 전달 경로를 재현합니다. | `enqueue`, `run` 명령 |
 | event.v1 importer | 별도 01–05 producer와 결합하지 않고 공통 event 계약을 통해 명시적으로 통합합니다. | `import_event`, `normalize_imported_event`, `pseudonymize_path` |
+| inotify collector | 활성 root의 변경 메타데이터만 이벤트로 만들어 telemetry 설정을 실제 관측 경계에 적용합니다. | `InotifyCollector`, `enqueue_agent_event`, `active_policy` |
 | 내구성 있는 agent 큐 | 서버 연결이 끊겨도 이벤트를 보존하고, 확인된 ID만 삭제합니다. | `open_queue`, `next_sequence`, `pending`, `delete_acked` |
 | TLS client | 서버 인증서와 SAN을 검증하고 client 인증서를 제시합니다. | `client_context`, `connect_socket`, `send_batch` |
 | ACK와 재시도 | 모호한 응답이나 전송 실패 뒤에도 데이터를 잃지 않게 합니다. | `ack_ids`, `flush` |
@@ -55,7 +56,7 @@ HMAC path ID는 익명화가 아닙니다. 같은 store에서는 동일 경로�
 
 ### 서명 정책 게시·동기화 경로
 
-Operator는 operator 인증서와 bearer token을 함께 사용합니다. server는 policy schema와 tenant, timestamp, allowed actions, 설정 상한, revision을 확인한 다음 원본 문서 bytes를 Ed25519로 서명하고 SQLite transaction에서 정책 revision·signature를 갱신합니다. 동일 revision·동일 bytes는 idempotent이고, 같은/낮은 revision의 변경 문서는 rollback으로 거부됩니다. Agent의 `sync-policy`는 이전 last-good document의 SHA-256을 `If-None-Match`에 보내며 ETag가 같으면 server가 304를 반환합니다. 새 문서를 받은 경우 envelope를 파싱하고 64-byte signature를 복원한 뒤 JSON 파싱 전에 원본 문서 bytes를 검증합니다. 이어서 allowed field/action, issuer·tenant scope, issued/expiry UTC 시각, safe integer revision, 허용 root와 canonical path component containment를 검사합니다. 유효한 새 revision만 SQLite `policy_state`와 `policy_audit`에 한 transaction으로 저장해 DB가 부분 갱신되는 것을 막습니다. 회귀 시험은 외부 root로 향하는 서명 정책을 거부하고 이전 revision·audit 값을 유지한 뒤 다음 valid revision이 저장되는 것을 확인합니다. 실행 경로의 `active_policy`는 저장 문서를 다시 parse하고 DB issuer·revision과 document를 대조한 뒤 `telemetry_enabled`와 expiry로 생성·전송을 게이트합니다. `sample_rate`는 새 합성 이벤트 생성에만 적용되고, 기존 큐 전송에는 영향을 주지 않습니다. `status`는 `NO_POLICY`, `STALE`, `ACTIVE`, `VALIDATED`와 revision, sample rate, root 개수, queue 크기를 보고합니다. Root 목록은 검증·개수 보고만 하며 파일 watcher에 연결되지 않았습니다. 문서를 DB에서 읽을 때 statement가 유효한 동안 issuer·document bytes를 소유형 문자열로 복사한 뒤 finalize합니다. 미래에 실제 감시기를 추가할 때 경로 검증과 파일 열기 사이의 filesystem TOCTOU도 해결해야 합니다.
+Operator는 operator 인증서와 bearer token을 함께 사용합니다. server는 policy schema와 tenant, timestamp, allowed actions, 설정 상한, revision을 확인한 다음 원본 문서 bytes를 Ed25519로 서명하고 SQLite transaction에서 정책 revision·signature를 갱신합니다. 동일 revision·동일 bytes는 idempotent이고, 같은/낮은 revision의 변경 문서는 rollback으로 거부됩니다. Agent의 `sync-policy`는 이전 last-good document의 SHA-256을 `If-None-Match`에 보내며 ETag가 같으면 server가 304를 반환합니다. 새 문서를 받은 경우 envelope를 파싱하고 64-byte signature를 복원한 뒤 JSON 파싱 전에 원본 문서 bytes를 검증합니다. 이어서 allowed field/action, issuer·tenant scope, issued/expiry UTC 시각, safe integer revision, 허용 root와 canonical path component containment를 검사합니다. 유효한 새 revision만 SQLite `policy_state`와 `policy_audit`에 한 transaction으로 저장해 DB가 부분 갱신되는 것을 막습니다. 회귀 시험은 외부 root로 향하는 서명 정책을 거부하고 이전 revision·audit 값을 유지한 뒤 다음 valid revision이 저장되는 것을 확인합니다. 실행 경로의 `active_policy`는 저장 문서를 다시 parse하고 DB issuer·revision과 document를 대조한 뒤 `telemetry_enabled`와 expiry로 생성·전송을 게이트합니다. `sample_rate`는 새 합성 이벤트 생성에만 적용되고, 기존 큐 전송에는 영향을 주지 않습니다. `status`는 `NO_POLICY`, `STALE`, `ACTIVE`, `VALIDATED`와 revision, sample rate, root 개수, queue 크기를 보고합니다. Root 목록은 검증된 뒤 장기 `run` collector의 watch tree로 적용됩니다. collector 추가 뒤의 기술 검증은 아직 수행하지 않았습니다. 문서를 DB에서 읽을 때 statement가 유효한 동안 issuer·document bytes를 소유형 문자열로 복사한 뒤 finalize합니다. 미래에 실제 감시기를 추가할 때 경로 검증과 파일 열기 사이의 filesystem TOCTOU도 해결해야 합니다.
 
 ## Linux 인터페이스와 자원 수명
 
@@ -74,7 +75,7 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 - TLS chain 검증과 hostname/IP SAN 검증은 server identity를 확인합니다. Server는 client chain을 검증하고 역할별 CN allowlist를 확인합니다. operator endpoint는 bearer token도 요구하지만 이는 lab 수준의 단순 RBAC입니다. 운영 enrollment, rotation, revocation, SAN URI 기반 identity는 구현되어 있지 않습니다.
 - 오류는 인증서·SAN 오류, TLS truncation, framing 위반, JSON 오류, DB transaction 실패, quota, hash 불일치, 잘못된 ACK, policy signature·scope·revision 실패로 나뉩니다. 새 event는 network 전에 저장되므로 일시 실패에 보존되지만 queue quota 또는 disk full은 저장할 수 없습니다. 정책이 없거나 stale/비활성일 때는 전송을 멈추되 이미 저장된 queue를 삭제하지 않습니다. SQLite 정책 데이터 손상이나 tenant 불일치는 실행 명령을 실패시킵니다.
 - 민감 키 이름 거부는 개인정보 보호의 보조 장치입니다. 완전한 정보 흐름 제어는 아니므로 schema, producer 제한, 권한, 로그 검토가 함께 필요합니다.
-- imported event의 허용 필드, path scope, `telemetry_enabled`, `sample_rate`, local key permission이 실제 전송 경계입니다. `path_id`의 keyed HMAC은 일반 SHA-256보다 외부의 사전 대입을 어렵게 하지만 local key 탈취나 store 전체 열람에는 보호를 제공하지 않습니다. 대상 경로의 완전한 race-free enforcement가 필요한 collector는 directory FD와 `openat2(2)` 같은 별도 설계가 필요합니다.
+- imported/collected event의 allowlist, policy root, `telemetry_enabled`, `sample_rate`, local key permission이 실제 전송 경계입니다. `path_id`의 keyed HMAC은 일반 SHA-256보다 외부의 사전 대입을 어렵게 하지만 local key 탈취나 store 전체 열람에는 보호를 제공하지 않습니다. Collector는 no-follow dirfd traversal을 사용하지만 mount namespace와 모든 filesystem race를 차단하는 보안 경계는 아닙니다.
 
 ## 대안과 설계 교환
 
@@ -91,9 +92,36 @@ Operator는 operator 인증서와 bearer token을 함께 사용합니다. server
 
 `docs/ARCHITECTURE.md`, `docs/THREAT_MODEL.md`, `docs/KEY_MANAGEMENT.md`를 먼저 읽습니다. 그다음 합성 event 하나를 SQLite insert부터 TLS, server commit, ACK, agent delete까지 추적하고, ACK 유실 시 재전송을 비교합니다. 마지막으로 정책 서명 검증에서 TLS identity와 issuer signature가 서로 대체할 수 없는 이유를 설명해 봅니다. `docs/DEBUGGING_EXERCISES.md`에는 정답 없이 세 개의 독립 구현 과제가 있습니다.
 
+## 장기 실행 inotify collector와 policy 적용
+
+### 이 하위 시스템이 필요한 이유
+
+정책의 `monitored_roots`가 값만 검증되고 관측 동작에는 연결되지 않으면 설정이 실제 기능을 제어하지 못합니다. 장기 `run --interval-seconds N` 경로는 signed last-good policy를 관찰 경계로 사용하고, 해당 루트의 파일시스템 메타데이터 변경을 로컬 event.v1로 바꿉니다. 사용자의 파일 내용은 열지 않습니다. inotify는 이벤트 기반이라 일정 간격으로 모든 파일을 읽는 polling보다 불필요한 입출력을 줄이지만, 이벤트 큐 overflow가 가능하므로 coverage 상태를 별도로 기록합니다.
+
+### 데이터와 제어 흐름
+
+1. `run`은 옵션이 있으면 Ed25519 정책을 받아 검증한 후 last-good 문서를 읽습니다. `telemetry_enabled`, `sample_rate`, expiry, tenant, revision, canonical monitored roots를 적용합니다.
+2. policy revision이나 roots가 바뀌면 기존 collector를 닫고 새 root 집합으로 교체합니다. 각 root부터 디렉터리를 열고, 디렉터리 watch를 등록한 다음 해당 디렉터리 항목을 열거하여 자식 디렉터리를 감시합니다.
+3. create, close-write, attribute, delete, move 알림은 file metadata event로 분류합니다. 이름은 정규화 경로의 HMAC ID로 바꾸고, device/inode 등 제한된 메타데이터와 함께 event.v1 allowlist를 거쳐 sequence를 배정하고 SQLite queue에 기록합니다.
+4. queue의 bounded batch를 mTLS로 전송합니다. 인증된 server의 ACK/duplicate ID를 받은 항목만 제거합니다. 네트워크가 끊기면 queue row는 남습니다.
+5. overflow, 접근 실패, watch 한도 초과, 디렉터리 이동/삭제는 `coverage.watch_degraded`로 표현하고 watch tree를 다시 구성합니다. Overflow 사이에 실제로 놓친 변경은 baseline과 비교해 복구하지 않으므로 degraded 상태를 healthy로 과장하지 않습니다.
+
+### Linux 인터페이스, 수명, 동시성
+
+- `inotify_init1(IN_NONBLOCK | IN_CLOEXEC)`은 이벤트 FD를 생성하고 `inotify_add_watch`는 디렉터리 변경 mask를 등록합니다. `poll`은 bounded interval 내 readiness를 기다리고 `read`는 여러 `inotify_event` 레코드를 가져옵니다.
+- 디렉터리 traversal은 `openat(O_DIRECTORY | O_NOFOLLOW)`, `fstatat(AT_SYMLINK_NOFOLLOW)`, `fdopendir(dup(fd))`, `readdir`를 사용합니다. 열린 directory FD의 `/proc/self/fd/N` 경로로 inotify watch를 붙여 path replacement race를 줄입니다. cross-device 하위 트리는 따라가지 않습니다.
+- `InotifyCollector`가 inotify FD와 watch descriptor→directory map을 소유하고 소멸 시 FD를 닫습니다. traversal 중의 directory FD와 `DIR*`는 각 호출 안에서 닫습니다. SQLite connection은 daemon의 한 thread가 collector event와 queue flush를 순서대로 처리합니다. 내부 작업 thread는 없습니다.
+- Directory watch 수는 4,096으로 제한됩니다. policy가 사라지거나 telemetry가 꺼지거나 expiry되면 collection을 멈춥니다. Sampling은 신규 이벤트에만 적용하고 이미 큐에 저장된 이벤트 전송은 별도 policy gate를 따릅니다.
+
+### 보안 가정, 실패 모드, 대안
+
+Collector는 서명 검증된 policy와 agent 계정의 directory search 권한을 전제로 합니다. symlink를 따라 디렉터리를 재귀하지 않고, file contents, xattrs, 임의 환경변수, process command line을 읽지 않습니다. HMAC pseudonym은 저장소별 secret key가 있어야 같은 경로의 반복을 연결할 수 있으며, 로컬 key가 유출되면 보호가 약해집니다. Inotify는 파일시스템/마운트 동작을 전부 포착하지 않습니다. bind mount, namespace, 권한 변동, kernel watch limit, overflow, 파일시스템별 지원 차이는 운영 coverage 한계입니다. 이 collector 추가 뒤에는 빌드나 테스트를 수행하지 않았으므로 구현 상태와 기술 검증 상태를 분리해 기록합니다.
+
+`fanotify`는 mount 단위 관측이나 permission event에 적합할 수 있으나 권한·capability와 운영 영향이 커서 이 권한 없는 endpoint lab의 기본값으로 삼지 않았습니다. `openat2`와 directory FD 기반 traversal은 scope traversal을 더 엄격히 구성하는 대안입니다. Periodic scanning은 inotify 유실 후 비교 기준을 제공하지만 비용이 더 크며, 커널 FIM agent나 BPF는 배포판 호환성과 권한 모델이 별도 과제입니다.
+
 ## 공식 문서
 
-- Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`connect(2)`](https://man7.org/linux/man-pages/man2/connect.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html)
+- Linux man-pages: [`socket(2)`](https://man7.org/linux/man-pages/man2/socket.2.html), [`connect(2)`](https://man7.org/linux/man-pages/man2/connect.2.html), [`accept(2)`](https://man7.org/linux/man-pages/man2/accept.2.html), [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`fstatat(2)`](https://man7.org/linux/man-pages/man2/fstatat.2.html), [`fdopendir(3)`](https://man7.org/linux/man-pages/man3/fdopendir.3.html), [`readdir(3)`](https://man7.org/linux/man-pages/man3/readdir.3.html), [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`inotify_init1(2)`](https://man7.org/linux/man-pages/man2/inotify_init1.2.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html)
 - OpenSSL: [`SSL_CTX_set_verify`](https://docs.openssl.org/3.0/man3/SSL_CTX_set_verify/), [`SSL_set1_host`](https://docs.openssl.org/3.0/man3/SSL_set1_host/), [`SSL_accept`](https://docs.openssl.org/3.0/man3/SSL_accept/), [`SSL_get_error`](https://docs.openssl.org/3.0/man3/SSL_get_error/), [`SSL_read`](https://docs.openssl.org/3.0/man3/SSL_read/), [`SSL_write`](https://docs.openssl.org/3.0/man3/SSL_write/)
 - OpenSSL random API: [`RAND_bytes`](https://docs.openssl.org/3.0/man3/RAND_bytes/)
 - OpenSSL keyed digest API: [`HMAC`](https://docs.openssl.org/3.0/man3/HMAC/)

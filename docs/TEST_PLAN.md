@@ -27,3 +27,12 @@ corpus_dir=$(mktemp -d)
 cp -R tests/http_fuzz_corpus/. "$corpus_dir"/
 ./build-fuzz/sea-http-parser-fuzz -runs=100000 -max_len=16384 "$corpus_dir"
 ```
+
+## 추가 구현 후 실행할 collector 확인 항목
+
+아래 항목은 recursive inotify collector 구현을 위한 미실행 계획이다. 구현 코드가 추가된 뒤 사용자 지시에 따라 빌드나 테스트를 수행하지 않았다.
+
+- Policy root 안에서 create, close-write, attribute, delete, rename 이벤트가 path HMAC만 포함해 durable queue에 쌓이는지 확인한다. Queue와 서버 payload에 raw path나 file content가 없어야 한다.
+- Root 외부 symlink, symlink directory, 다른 device mount, directory rename, permission loss, inotify watch cap/overflow를 각각 재현하고 coverage degraded 동작을 확인한다.
+- Running agent에서 revision/root replacement, telemetry disable, expiry, sample-rate update를 적용하고 queue retention/flush 계약을 확인한다.
+- Agent/service stop, restart, `sync-policy` 동시 실행과 quota/full-disk 상황에서 FD, PID file, SQLite transaction lifetime을 관찰한다.
