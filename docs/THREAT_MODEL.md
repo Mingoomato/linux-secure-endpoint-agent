@@ -10,7 +10,7 @@
 
 ## Data minimization
 
-Synthetic health events and explicit `event.v1` imports are policy-gated. Long-running `run` mode now also watches active monitored roots with inotify and emits allowlisted filesystem metadata only. It never opens file content; the raw path is replaced with a per-store HMAC identifier before queue storage. Missing/expired policy or disabled telemetry prevents creation and pauses sending while existing queued rows remain stored; `sample_rate` gates new events. Symlink directories and cross-device subtrees are skipped; watch limits and overflow produce degraded coverage. The collector change has not been built or verified. Server logs contain generic request rejection summaries.
+Synthetic health events and explicit `event.v1` imports are policy-gated. Long-running `run` mode now also watches active monitored roots with inotify and emits allowlisted filesystem metadata only. It never opens file content; the raw path is replaced with a per-store HMAC identifier before queue storage. Missing/expired policy or disabled telemetry prevents creation and pauses sending while existing queued rows remain stored; `sample_rate` gates new events. Symlink directories and cross-device subtrees are skipped; watch limits and overflow produce degraded coverage. The current collector builds and passes focused rename/watch-rebuild and queue privacy tests; genuine kernel overflow and namespace/resource fault paths remain unverified. Server logs contain generic request rejection summaries.
 
 ## Residual risks
 
