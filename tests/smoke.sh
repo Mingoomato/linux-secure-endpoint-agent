@@ -699,6 +699,27 @@ status = json.load(open(sys.argv[1], encoding="utf-8"))
 assert status["queued"] == 1, status
 PY
 
+# A rejected heartbeat must not exceed the byte quota or consume a sequence number.
+sync_policy "$tmp/quota-agent-store" >/dev/null
+python3 - "$tmp/quota-agent-store/spool.sqlite" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    db.execute("INSERT INTO queue(event_id,sequence,observed_at,payload,payload_hash) "
+               "VALUES('quota-seed',0,'2026-10-10T00:00:00Z',zeroblob(67108863),'seed')")
+PY
+if "$bin_dir/sw-agentd" run --tenant smoke-tenant --store "$tmp/quota-agent-store" \
+    >"$tmp/quota-agent.log" 2>&1; then
+    echo "heartbeat exceeded the durable queue byte quota" >&2
+    exit 1
+fi
+grep -q 'SEA_QUEUE_FULL' "$tmp/quota-agent.log"
+python3 - "$tmp/quota-agent-store/spool.sqlite" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    assert db.execute("SELECT count(*),sum(length(payload)) FROM queue").fetchone() == (1, 67108863)
+    assert db.execute("SELECT value FROM meta WHERE key='next_sequence'").fetchone() == ('0',)
+PY
+
 # Keep an event durable while the server is offline, then deliver it after restart.
 sync_policy "$tmp/offline-agent-store" >/dev/null
 kill "$server_pid"

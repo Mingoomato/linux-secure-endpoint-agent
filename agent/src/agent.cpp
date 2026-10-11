@@ -208,44 +208,45 @@ std::uint64_t next_sequence_in_transaction(sqlite3 *db) {
     if (sqlite3_changes(db) != 1) throw std::runtime_error("sequence update failed");
     return sequence;
 }
-std::uint64_t next_sequence(sqlite3 *db) {
+void enqueue(sqlite3 *db, const std::string &event_id, const std::string &observed) {
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
-        throw std::runtime_error("sequence transaction unavailable");
+        throw std::runtime_error("queue transaction unavailable");
     try {
-        const auto sequence = next_sequence_in_transaction(db);
-        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
-            throw std::runtime_error("sequence commit failed");
-        return sequence;
-    } catch (...) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        throw;
-    }
-}
-void enqueue(sqlite3 *db, const std::string &event_id, std::uint64_t sequence, const std::string &observed) {
-    sqlite3_stmt *count = nullptr;
-    sql_check(sqlite3_prepare_v2(db, "SELECT count(*),COALESCE(sum(length(payload)),0) FROM queue", -1, &count, nullptr), db, "queue size");
-    sqlite3_step(count);
-    int rows = sqlite3_column_int(count, 0);
-    sqlite3_int64 bytes = sqlite3_column_int64(count, 1);
-    sqlite3_finalize(count);
-    if (rows >= 10000 || bytes >= 64LL * 1024LL * 1024LL)
-        throw std::runtime_error("SEA_QUEUE_FULL: spool quota reached; event retained nowhere");
+    const std::uint64_t sequence = next_sequence_in_transaction(db);
     const std::string payload_data = "{\"source\":\"synthetic\",\"worker_count\":1}";
     const std::string payload_hash = sha256(payload_data);
     std::string payload = "{\"event_id\":\"" + event_id + "\",\"sequence\":" +
         std::to_string(sequence) + ",\"observed_at\":\"" + observed +
         "\",\"kind\":\"health.heartbeat\",\"coverage\":\"healthy\",\"payload\":" +
         payload_data + ",\"payload_hash\":\"" + payload_hash + "\"}";
-    sqlite3_stmt *s = nullptr;
-    sql_check(sqlite3_prepare_v2(db, "INSERT INTO queue(event_id,sequence,observed_at,payload,payload_hash) VALUES(?1,?2,?3,?4,?5)",
-                                 -1, &s, nullptr), db, "prepare enqueue");
-    sqlite3_bind_text(s, 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(sequence));
-    sqlite3_bind_text(s, 3, observed.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, payload.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, payload_hash.c_str(), -1, SQLITE_TRANSIENT);
-    sql_check(sqlite3_step(s), db, "enqueue event");
-    sqlite3_finalize(s);
+    {
+        ScopedStatement count;
+        sql_check(sqlite3_prepare_v2(db, "SELECT count(*),COALESCE(sum(length(payload)),0) FROM queue", -1,
+            &count.value, nullptr), db, "queue size");
+        sql_check(sqlite3_step(count.value), db, "queue size read");
+        constexpr sqlite3_int64 limit = 64LL * 1024LL * 1024LL;
+        const int rows = sqlite3_column_int(count.value, 0);
+        const sqlite3_int64 bytes = sqlite3_column_int64(count.value, 1);
+        if (rows >= 10000 || bytes < 0 || bytes > limit - static_cast<sqlite3_int64>(payload.size()))
+            throw std::runtime_error("SEA_QUEUE_FULL: spool quota reached; event retained nowhere");
+    }
+    {
+        ScopedStatement statement;
+        sql_check(sqlite3_prepare_v2(db, "INSERT INTO queue(event_id,sequence,observed_at,payload,payload_hash) VALUES(?1,?2,?3,?4,?5)",
+                                     -1, &statement.value, nullptr), db, "prepare enqueue");
+        sql_check(sqlite3_bind_text(statement.value, 1, event_id.c_str(), -1, SQLITE_TRANSIENT), db, "enqueue id");
+        sql_check(sqlite3_bind_int64(statement.value, 2, static_cast<sqlite3_int64>(sequence)), db, "enqueue sequence");
+        sql_check(sqlite3_bind_text(statement.value, 3, observed.c_str(), -1, SQLITE_TRANSIENT), db, "enqueue time");
+        sql_check(sqlite3_bind_text(statement.value, 4, payload.c_str(), -1, SQLITE_TRANSIENT), db, "enqueue payload");
+        sql_check(sqlite3_bind_text(statement.value, 5, payload_hash.c_str(), -1, SQLITE_TRANSIENT), db, "enqueue hash");
+        sql_check(sqlite3_step(statement.value), db, "enqueue event");
+    }
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw std::runtime_error("queue commit failed");
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
+    }
 }
 bool enqueue_synthetic_if_enabled(sqlite3 *db, const std::string &tenant) {
     const RuntimePolicy policy = active_policy(db, tenant, true);
@@ -262,8 +263,7 @@ bool enqueue_synthetic_if_enabled(sqlite3 *db, const std::string &tenant) {
             std::floor(policy.sample_rate * static_cast<double>(kSampleRange)));
         if (sample >= threshold) return false;
     }
-    const std::uint64_t sequence = next_sequence(db);
-    enqueue(db, uuid(), sequence, now_iso());
+    enqueue(db, uuid(), now_iso());
     return true;
 }
 std::vector<Queued> pending(sqlite3 *db, std::size_t limit) {

@@ -46,3 +46,7 @@ The GitHub Actions build/test commands were run locally on Kali Linux 7.1.5+kali
 mTLS, collector rename/watch rebuild, policy and registry certificate lifecycle loopback tests pass; migration/fault/resource matrices remain open.
 
 The original GitHub Actions runs remain blocked before execution by account billing/spending-limit state. Current-source local results do not close the remaining full-SRS runtime, fault, scale or OS gates. Owner mastery remains unassessed.
+
+## Queue quota follow-up — 2026-10-11
+
+The synthetic heartbeat now checks the full serialized payload against the 64 MiB queue limit, with sequence allocation, quota check, and insert in one SQLite `BEGIN IMMEDIATE` transaction. A focused loopback smoke test passed: a queue seeded to one byte below the limit rejects another heartbeat with `SEA_QUEUE_FULL`, leaves the durable row intact, and rolls back the sequence increment. The wider 429, disk-full, concurrent producer, and long-duration backpressure gates remain open. See the portfolio's subsequent local CI result for the current source.

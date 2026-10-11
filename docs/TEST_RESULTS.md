@@ -1,5 +1,7 @@
 # 검증 보고서 — SRS-06 Secure Endpoint Agent Control Server
 
+> 후속 결과 (2026-10-11): 합성 heartbeat의 64 MiB 초과 삽입 방지와 sequence/삽입 단일 트랜잭션을 구현했습니다. 64 MiB에서 1바이트 모자란 큐의 거부·행 보존·순번 rollback을 실제 SQLite smoke로 확인했습니다. 현재 소스 전체 GCC/Clang CI 결과는 포트폴리오 루트의 로컬 CI 증거를 따릅니다. 아래 오래된 수치는 당시 코드 기준 기록입니다.
+
 > Latest / 최신: [2026-10-11 checkpoint](VALIDATION_CHECKPOINT.md). Earlier entries below describe their own historical revisions; they do not override this scoped checkpoint.
 
 ## 요약
