@@ -27,6 +27,10 @@ target_compile_options(sw-probe PRIVATE -std=c17 -Wall -Wextra -Wpedantic -Werro
 
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME sea-inotify-collector COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/collector.py $<TARGET_FILE:sw-agentd>)
+    set_tests_properties(sea-inotify-collector PROPERTIES TIMEOUT 60)
     add_test(NAME sea-mtls-policy-smoke
         COMMAND ${CMAKE_COMMAND} -E env BIN_DIR=${CMAKE_CURRENT_BINARY_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)

@@ -1,5 +1,7 @@
 # Requirements traceability (SRS-06)
 
+Latest scoped evidence: [2026-10-11 validation checkpoint](VALIDATION_CHECKPOINT.md). Historical pending/unverified rows below remain applicable to gates not exercised by that checkpoint.
+
 The previously recorded loopback integration verifies selected mTLS, an absolute TLS handshake deadline, separated operator authorization, policy publication/signing/fetch, ETag/304, agent sync, last-good recovery, synthetic and explicit `event.v1` queueing, path pseudonymization and scope, deduplication, fail-closed and sampling gates, and an HTTP receive deadline. A recursive inotify collector, file/directory rename-cookie pairing, watch preflight before policy commit, and prepare-before-swap runtime reload were added after that recorded verification. SQLite agent enrollment, certificate fingerprint pinning, rotation, revocation, and re-enrollment routes were also added later. These changes have not been built or verified. Overflow history reconciliation, directory move fault/coverage gates, route-duration deadline, import fault/concurrency matrices, performance, resource-fault, and deployment matrices remain open. See `docs/TEST_RESULTS.md`; older passing evidence does not cover these additions.
 
 | Requirement | Source / artifact | Verification | Status |

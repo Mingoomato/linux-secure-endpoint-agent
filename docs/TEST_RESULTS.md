@@ -1,5 +1,7 @@
 # 검증 보고서 — SRS-06 Secure Endpoint Agent Control Server
 
+> Latest / 최신: [2026-10-11 checkpoint](VALIDATION_CHECKPOINT.md). Earlier entries below describe their own historical revisions; they do not override this scoped checkpoint.
+
 ## 요약
 
 - **구현 상태:** 부분 구현. 이 저장소는 교육용 loopback agent/control server이며 SRS 전체 기능을 구현했다고 주장하지 않습니다.

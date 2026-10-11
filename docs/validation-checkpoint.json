@@ -1,0 +1,14 @@
+{
+  "date": "2026-10-11",
+  "environment": "Linux 7.1.5+kali-amd64 x86_64; GCC 16.2.0; CMake Release; Python 3.14.7",
+  "result": "5/5 CTest passed.",
+  "scope": "Real offline inotify directory-rename pairing, fresh-FD watch rebuilding, continued file collection, path/content privacy, plus existing mTLS/policy/restart and JSON/HTTP parser suites.",
+  "remaining": "Registry lifecycle fault/migration, loss-history reconciliation, resource/namespace and extended network/OS matrices remain pending.",
+  "source_sha256": {
+    "agent/src/agent.cpp": "8fd46ef9eafe93d03a4cf9272bf12ea7fd0b2aac277d377f7b891b1b13d9057e",
+    "server/src/server.cpp": "39692afe6e69acf4467134cf561432e0c35f375abbb6c16860474085cecbd961",
+    "tests/collector.py": "8dc71369f9a219ff7c503b461f30c50268170617d5c9e6dc5280811728c5040e"
+  },
+  "owner_mastery": "unassessed",
+  "remote_ci": "new_workflow_pending_remote_run"
+}
