@@ -10,5 +10,6 @@
     "tests/collector.py": "8dc71369f9a219ff7c503b461f30c50268170617d5c9e6dc5280811728c5040e"
   },
   "owner_mastery": "unassessed",
-  "remote_ci": "new_workflow_pending_remote_run"
+  "remote_ci": "blocked_before_execution_account_billing_or_spending_limit",
+  "remote_ci_url": "https://github.com/Mingoomato/linux-secure-endpoint-agent/actions/runs/38107488162"
 }
