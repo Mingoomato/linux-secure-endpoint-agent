@@ -6,7 +6,7 @@
 
 `agent/src/agent.cpp`의 `main`이 하위 명령을 고르고 `Config`를 구성합니다. `is_loopback`은 network command가 외부 host를 대상으로 하지 못하게 제한합니다. `open_queue`는 전용 디렉터리를 준비하고 `spool.sqlite`에서 WAL, `synchronous=FULL`, queue/sequence/imported-event/policy 테이블을 설정합니다.
 
-`run`은 `enqueue_synthetic_if_enabled`를 호출합니다. 이 함수는 `active_policy`로 SQLite의 last-good 정책을 읽고 tenant·revision·schema·expiry·settings·action scope를 다시 확인합니다. 활성 정책이 없거나 만료·비활성이면 새 row를 만들지 않습니다. `sample_rate=0`이면 생성만 억제하고, 0과 1 사이면 OpenSSL `RAND_bytes`를 이용한 균등 53-bit 표본으로 새 이벤트를 선택합니다. 허용된 이벤트에 한해 `next_sequence`가 `BEGIN IMMEDIATE` transaction으로 sequence를 증가시키고, `enqueue`가 고정 합성 상태 payload와 UUID, timestamp, payload hash를 만들고 quota를 확인해 row를 기록합니다. 이 저장이 `send_batch`보다 먼저 일어나는 것이 전송 실패 시 보존의 근거입니다.
+`run`은 `enqueue_synthetic_if_enabled`를 호출합니다. 이 함수는 `active_policy`로 SQLite의 last-good 정책을 읽고 tenant·revision·schema·expiry·settings·action scope를 다시 확인합니다. 활성 정책이 없거나 만료·비활성이면 새 row를 만들지 않습니다. `sample_rate=0`이면 생성만 억제하고, 0과 1 사이면 OpenSSL `RAND_bytes`를 이용한 균등 53-bit 표본으로 새 이벤트를 선택합니다. 허용된 이벤트의 `enqueue`는 `BEGIN IMMEDIATE` 안에서 sequence 증가, 직렬화한 payload를 포함한 행·바이트 quota 확인, row 삽입을 함께 수행합니다. 거부되면 rollback하여 sequence도 소모하지 않습니다. 장기 실행 모드는 `SEA_QUEUE_FULL`을 기록하고 이미 저장된 큐 전송을 계속 시도합니다. 이 저장이 `send_batch`보다 먼저 일어나는 것이 전송 실패 시 보존의 근거입니다.
 
 ## 2. Client TLS와 HTTP 응답
 

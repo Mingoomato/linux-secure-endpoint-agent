@@ -13,7 +13,7 @@
 | 합성 이벤트 생성 | 실제 파일이나 사용자 데이터 없이 전달 경로를 재현합니다. | `enqueue`, `run` 명령 |
 | event.v1 importer | 별도 01–05 producer와 결합하지 않고 공통 event 계약을 통해 명시적으로 통합합니다. | `import_event`, `normalize_imported_event`, `pseudonymize_path` |
 | inotify collector | 활성 root의 변경 메타데이터만 이벤트로 만들어 telemetry 설정을 실제 관측 경계에 적용합니다. | `InotifyCollector`, `enqueue_agent_event`, `active_policy` |
-| 내구성 있는 agent 큐 | 서버 연결이 끊겨도 이벤트를 보존하고, 확인된 ID만 삭제합니다. | `open_queue`, `next_sequence`, `pending`, `delete_acked` |
+| 내구성 있는 agent 큐 | 서버 연결이 끊겨도 이벤트를 보존하고, 확인된 ID만 삭제합니다. | `open_queue`, `next_sequence_in_transaction`, `enqueue`, `pending`, `delete_acked` |
 | TLS client | 서버 인증서와 SAN을 검증하고 client 인증서를 제시합니다. | `client_context`, `connect_socket`, `send_batch` |
 | ACK와 재시도 | 모호한 응답이나 전송 실패 뒤에도 데이터를 잃지 않게 합니다. | `ack_ids`, `flush` |
 | Runtime policy gate | 서명 정책을 읽어 합성 이벤트 생성과 저장 큐 전송을 fail-closed 방식으로 제어합니다. | `active_policy`, `enqueue_synthetic_if_enabled`, `flush` |
@@ -31,7 +31,7 @@
 
 1. CLI가 endpoint, agent ID, 인증서 경로와 SQLite store를 읽습니다. 네트워크 명령은 loopback 대상만 허용합니다.
 2. `open_queue`가 store 디렉터리 권한을 제한하고 SQLite WAL과 `synchronous=FULL`을 설정합니다. 큐, sequence, 정책 상태 테이블을 준비합니다.
-3. `enqueue_synthetic_if_enabled`는 먼저 `active_policy`로 last-good 문서를 읽어 tenant, revision, schema, expiry, 설정과 action scope를 확인합니다. 정책이 없거나 만료·비활성 상태면 fail closed로 새 이벤트를 만들지 않습니다. 활성 정책에서는 `sample_rate=0`이면 생성하지 않고, 0과 1 사이 값이면 `RAND_bytes`에서 얻은 균등 53-bit 표본으로 생성 여부를 결정합니다. 생성 대상으로 선택된 경우에만 `next_sequence`가 sequence를 저장하고 `enqueue`가 고정된 합성 payload를 hash·quota 확인 뒤 network 전에 기록합니다.
+3. `enqueue_synthetic_if_enabled`는 먼저 `active_policy`로 last-good 문서를 읽어 tenant, revision, schema, expiry, 설정과 action scope를 확인합니다. 정책이 없거나 만료·비활성 상태면 fail closed로 새 이벤트를 만들지 않습니다. 활성 정책에서는 `sample_rate=0`이면 생성하지 않고, 0과 1 사이 값이면 `RAND_bytes`에서 얻은 균등 53-bit 표본으로 생성 여부를 결정합니다. 선택된 경우 `enqueue`가 sequence, 직렬화한 합성 payload의 quota, row 삽입을 하나의 SQLite write transaction에 넣습니다. 포화로 거부되면 sequence도 rollback하며, 장기 실행 모드는 오류를 로그에 남기고 기존 큐의 전송을 계속 시도합니다.
 4. `pending`은 sequence 순서로 제한된 batch를 가져옵니다. `send_batch`는 CA, client 인증서, private-key 권한, CN, loopback 주소와 서버 DNS/IP SAN을 검증한 뒤 OpenSSL TLS 연결을 엽니다.
 5. `flush`는 전송할 때마다 `active_policy`를 다시 확인합니다. telemetry가 비활성·만료면 네트워크 전송을 멈추고 DB queue 행을 그대로 둡니다. `sample_rate=0`은 새 이벤트 생성만 막으므로, telemetry가 켜져 있으면 이전에 쌓인 행을 전송할 수 있습니다. HTTP 요청은 `application/json`과 정확한 `Content-Length`를 포함합니다. event 응답 파서는 header 16 KiB·body 1 MiB 상한, 단일 `Content-Length`, `Transfer-Encoding` 거부, HTTP 200 status와 완전한 본문 길이를 확인합니다. 그 외 status는 ACK로 처리하지 않습니다. 별도 policy fetch는 200/304만 허용합니다. `ack_ids`는 accepted/duplicate ID를 읽고, `flush`는 실제 전송한 batch ID와 대조한 뒤 일치한 항목만 트랜잭션으로 삭제합니다.
 6. 네트워크·파싱 실패는 bounded exponential backoff와 jitter 뒤 재시도합니다. 서버가 commit하고 ACK가 유실되면 다음 전송은 중복으로 판별됩니다.
