@@ -238,6 +238,8 @@ import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 assert db.execute("select count(*) from events").fetchone()[0] == 1
 PY
+python3 "$root_dir/tests/registry_lifecycle.py" "$certs" "$port" \
+    "$tmp/admin-token" "$tmp/server.sqlite"
 
 mkdir "$tmp/allowed-root"
 cat >"$tmp/policy.json" <<EOF
