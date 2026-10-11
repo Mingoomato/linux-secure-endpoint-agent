@@ -5,10 +5,12 @@ root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 bin_dir=${BIN_DIR:-"$root_dir/build"}
 tmp=$(mktemp -d)
 server_pid=
+quota_pid=
 cleanup() {
     status=$?
     trap - EXIT HUP INT TERM
     if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi
+    if [ -n "$quota_pid" ]; then kill "$quota_pid" 2>/dev/null || true; wait "$quota_pid" 2>/dev/null || true; fi
     if [ "$status" -ne 0 ] && [ -f "$tmp/server.log" ]; then cat "$tmp/server.log" >&2; fi
     rm -rf "$tmp"
     exit "$status"
@@ -725,6 +727,21 @@ sync_policy "$tmp/offline-agent-store" >/dev/null
 kill "$server_pid"
 wait "$server_pid" || true
 server_pid=
+"$bin_dir/sw-agentd" run --interval-seconds 1 --endpoint 127.0.0.1 --port "$port" \
+    --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \
+    --cert "$certs/agent.crt" --key "$certs/agent.key" --store "$tmp/quota-agent-store" \
+    >"$tmp/quota-agent-long-running.log" 2>&1 &
+quota_pid=$!
+sleep 2
+if ! kill -0 "$quota_pid" 2>/dev/null; then
+    echo "long-running agent exited on expected queue backpressure" >&2
+    cat "$tmp/quota-agent-long-running.log" >&2
+    exit 1
+fi
+kill "$quota_pid"
+wait "$quota_pid" || true
+quota_pid=
+grep -q 'heartbeat backpressure: SEA_QUEUE_FULL' "$tmp/quota-agent-long-running.log"
 set +e
 "$bin_dir/sw-agentd" run --endpoint 127.0.0.1 --port "$port" \
     --agent-id 00000000-0000-4000-8000-000000000001 --tenant smoke-tenant --ca "$certs/ca.crt" \

@@ -266,6 +266,15 @@ bool enqueue_synthetic_if_enabled(sqlite3 *db, const std::string &tenant) {
     enqueue(db, uuid(), now_iso());
     return true;
 }
+bool enqueue_synthetic_with_backpressure(sqlite3 *db, const std::string &tenant) {
+    try {
+        return enqueue_synthetic_if_enabled(db, tenant);
+    } catch (const std::runtime_error &error) {
+        if (std::string(error.what()).find("SEA_QUEUE_FULL") == std::string::npos) throw;
+        std::cerr << "heartbeat backpressure: " << error.what() << '\n';
+        return false;
+    }
+}
 std::vector<Queued> pending(sqlite3 *db, std::size_t limit) {
     sqlite3_stmt *s = nullptr;
     sql_check(sqlite3_prepare_v2(db, "SELECT event_id,sequence,observed_at,payload,payload_hash FROM queue ORDER BY sequence LIMIT ?1",
@@ -1944,7 +1953,7 @@ int main(int argc, char **argv) {
             };
             std::string deferred_policy_identity;
             std::chrono::steady_clock::time_point deferred_retry_after{};
-            (void)enqueue_synthetic_if_enabled(db, c.tenant);
+            (void)enqueue_synthetic_with_backpressure(db, c.tenant);
             rc = flush(db, c);
 
             using Clock = std::chrono::steady_clock;
@@ -2004,7 +2013,7 @@ int main(int argc, char **argv) {
 
                 now = Clock::now();
                 if (now >= next_heartbeat) {
-                    (void)enqueue_synthetic_if_enabled(db, c.tenant);
+                    (void)enqueue_synthetic_with_backpressure(db, c.tenant);
                     next_heartbeat = now + flush_delay;
                 }
                 if (now >= next_flush) {
