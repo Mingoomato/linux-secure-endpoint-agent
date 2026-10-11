@@ -7,9 +7,21 @@
   "source_sha256": {
     "agent/src/agent.cpp": "8fd46ef9eafe93d03a4cf9272bf12ea7fd0b2aac277d377f7b891b1b13d9057e",
     "server/src/server.cpp": "39692afe6e69acf4467134cf561432e0c35f375abbb6c16860474085cecbd961",
-    "tests/collector.py": "8dc71369f9a219ff7c503b461f30c50268170617d5c9e6dc5280811728c5040e"
+    "tests/collector.py": "8dc71369f9a219ff7c503b461f30c50268170617d5c9e6dc5280811728c5040e",
+    "tests/smoke.sh": "7cead10a146de0a21d47327f75e54b3a6c4e621d3182cffaa6b5852a349305aa",
+    "tests/registry_lifecycle.py": "a4164aaa8da5dfc2d3045aa4bc3980cf6dbb4e80586406110079b4cc6a2adf5d"
   },
   "owner_mastery": "unassessed",
   "remote_ci": "blocked_before_execution_account_billing_or_spending_limit",
-  "remote_ci_url": "https://github.com/Mingoomato/linux-secure-endpoint-agent/actions/runs/38107488162"
+  "remote_ci_url": "https://github.com/Mingoomato/linux-secure-endpoint-agent/actions/runs/38107488162",
+  "local_followup": {
+    "date": "2026-10-11",
+    "host": "Kali Linux 7.1.5+kali-amd64 x86_64",
+    "gcc_release_ctest": "5/5 pass",
+    "clang_release_ctest": "5/5 pass",
+    "clang_asan_ubsan": "5/5 CTest pass",
+    "fuzz_smoke_requested_runs": 50000,
+    "kernel_module_compile": "not_applicable",
+    "full_srs_status": "pending"
+  }
 }

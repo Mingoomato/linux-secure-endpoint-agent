@@ -33,3 +33,16 @@ Registry lifecycle fault/migration, loss-history reconciliation, resource/namesp
 ### Remote run outcome
 
 [Run 38107488162](https://github.com/Mingoomato/linux-secure-endpoint-agent/actions/runs/38107488162) was created after the source commit, but GitHub refused to start every job because of an account billing/payment or spending-limit restriction. This is **BLOCKED before execution**, not a passing remote check and not an observed compiler/test failure. No account payment or visibility settings were changed.
+
+## Current-source local verification follow-up — 2026-10-11
+
+The GitHub Actions build/test commands were run locally on Kali Linux 7.1.5+kali-amd64, x86_64, GCC 16.2.0, Clang 21.1.8 and CMake 4.4.3. This host is not the Ubuntu 24.04 runner. No kernel module was loaded.
+
+- GCC Release CTest: **5/5 passed**.
+- Clang Release CTest: **5/5 passed**.
+- Clang AddressSanitizer + UBSan CTest: **5/5 passed**.
+- Current-source Clang ASan/UBSan finite parser fuzz smoke: **50,000 requested runs completed** without a finding. This is not a sustained fuzz campaign.
+
+mTLS, collector rename/watch rebuild, policy and registry certificate lifecycle loopback tests pass; migration/fault/resource matrices remain open.
+
+The original GitHub Actions runs remain blocked before execution by account billing/spending-limit state. Current-source local results do not close the remaining full-SRS runtime, fault, scale or OS gates. Owner mastery remains unassessed.
